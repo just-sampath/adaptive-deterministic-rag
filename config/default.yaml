@@ -1,0 +1,115 @@
+app:
+  host: 0.0.0.0
+  port: 8000
+  log_level: INFO
+
+auth:
+  mode: trusted_headers
+  tenant_header: X-Tenant-ID
+  user_header: X-User-ID
+  roles_header: X-Roles
+  token_header: X-Auth-Token
+  debug_token_header: X-Debug-Token
+  admin_role: administrator
+
+mongodb:
+  provider: mongodb
+  database: adaptive_rag
+  trace_collection: rag_request_traces
+  telemetry_collection: telemetry_events
+  trace_retention_days: 30
+  telemetry_retention_days: 30
+  server_selection_timeout_ms: 3000
+  operation_timeout_ms: 5000
+
+ai:
+  provider: openai
+  generation_model: gpt-5.6
+  contextualization_model: gpt-5.6-luna
+  query_recovery_model: gpt-5.6-luna
+  evaluation_model: gpt-5.6-luna
+  embedding_model: text-embedding-3-small
+  embedding_dimension: 1536
+  max_output_tokens: 4096
+  max_retries: 2
+
+vector_store:
+  provider: qdrant
+  collection_alias: adaptive_rag_chunks
+  dense_vector_name: dense
+  sparse_vector_name: sparse
+  sparse:
+    encoder: bm25
+    k1: 1.2
+    b: 0.75
+    average_document_tokens: 256
+    hash_space: 2147483647
+    language: english
+
+reranker:
+  provider: cohere
+  model: rerank-v4.0-pro
+
+retrieval:
+  fusion_strategy: rrf
+  dense_weight: 0.6
+  sparse_weight: 0.4
+  rrf_k: 60
+  happy_dense_k: 40
+  happy_sparse_k: 40
+  happy_candidate_k: 30
+  recall_dense_k: 100
+  recall_sparse_k: 100
+  recall_candidate_k: 80
+  generation_k: 8
+  max_query_variants: 4
+  max_decomposed_queries: 3
+  query_variant_concurrency: 4
+  query_drift_threshold: 0.55
+  embedding_cache_entries: 1000
+
+contextualization:
+  enabled: true
+  detector: model
+  detector_model: gpt-5.6-luna
+  history_messages: 30
+  followup_threshold: 0.2
+  message_threshold: 0.3
+  min_recent_messages: 2
+  max_context_characters: 12000
+
+context:
+  max_tokens: 8000
+  max_seed_chunks: 8
+  max_document_share: 0.4
+  max_neighbors_per_seed: 1
+  short_chunk_tokens: 40
+
+policy:
+  max_generation_repairs: 1
+  max_strategies: 4
+  allow_verified_partial: true
+  allow_abstention: true
+
+timeouts:
+  request_seconds: 60
+  finalization_reserve_seconds: 5
+  followup_detection_seconds: 2
+  contextualization_seconds: 10
+  query_recovery_seconds: 10
+  embedding_seconds: 2
+  retrieval_seconds: 3
+  reranking_seconds: 3
+  generation_seconds: 20
+  evaluation_seconds: 10
+
+telemetry:
+  enabled: true
+  content_mode: redacted
+  queue_capacity: 2000
+  batch_size: 100
+  shutdown_timeout_seconds: 5
+  direct_write_timeout_seconds: 1
+
+answers:
+  inline_citations: true

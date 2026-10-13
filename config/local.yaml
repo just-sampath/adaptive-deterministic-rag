@@ -1,0 +1,7 @@
+# Safe, non-secret overrides for local development only.
+app:
+  log_level: DEBUG
+
+telemetry:
+  queue_capacity: 500
+  batch_size: 25

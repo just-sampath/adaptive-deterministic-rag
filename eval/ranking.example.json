@@ -1,0 +1,12 @@
+[
+  {
+    "id": "policy-retention",
+    "retrieved_ids": ["chunk-policy-2", "chunk-policy-1", "chunk-unrelated"],
+    "relevant_ids": ["chunk-policy-1", "chunk-policy-2"]
+  },
+  {
+    "id": "unknown-answer",
+    "retrieved_ids": [],
+    "relevant_ids": []
+  }
+]

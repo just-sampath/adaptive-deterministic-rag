@@ -1,0 +1,44 @@
+services:
+  api:
+    build:
+      context: .
+    init: true
+    env_file:
+      - .env
+    environment:
+      # Local development stack only. Deployments set APP_ENV=production and real secrets.
+      APP_ENV: local
+      MONGODB_URI: mongodb://mongo:27017
+      QDRANT_URL: http://qdrant:6333
+    ports:
+      - "8000:8000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    restart: on-failure
+
+  mongo:
+    image: mongo:8.0.29
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  qdrant:
+    image: qdrant/qdrant:v1.16.3
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+volumes:
+  mongo-data:
+  qdrant-data:
