@@ -127,7 +127,7 @@ def _compose(settings: Settings, resources: list[AsyncCloseable]) -> AppContaine
     """Wire the process graph in dependency order; every client is tracked when created."""
 
     clients = _build_clients(settings, resources)
-    text_model = OpenAITextModel(clients.openai)
+    text_model = OpenAITextModel(clients.openai, reasoning_effort=settings.ai.reasoning_effort)
     embeddings = OpenAIEmbeddingProvider(
         clients.openai,
         model=settings.ai.embedding_model,

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import TypeVar
+from collections.abc import Mapping, Sequence
+from typing import Any, TypeVar, cast
 
-from openai import AsyncOpenAI, OpenAIError
+from openai import AsyncOpenAI, Omit, OpenAIError, omit
+from openai.lib._pydantic import to_strict_json_schema
+from openai.types.responses import ResponseFormatTextJSONSchemaConfigParam
+from openai.types.shared import ReasoningEffort
+from openai.types.shared_params import Reasoning
 from pydantic import BaseModel, ValidationError
 
 from models.domain import EmbeddingResult, ModelResult, ModelUsage
@@ -13,6 +17,8 @@ from utils.errors import ProviderError, ProviderResponseError
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 _EMBEDDING_BATCH_SIZE = 256
+# Schema keys whose values map names to subschemas; the names themselves are not keywords.
+_NAMED_SUBSCHEMAS = frozenset({"properties", "$defs", "definitions", "patternProperties"})
 
 
 def build_openai_client(
@@ -35,8 +41,14 @@ def build_openai_client(
 class OpenAITextModel:
     """Execute schema-constrained model calls through the Responses API."""
 
-    def __init__(self, client: AsyncOpenAI) -> None:
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        *,
+        reasoning_effort: Mapping[str, str] | None = None,
+    ) -> None:
         self._client = client
+        self._reasoning_effort = dict(reasoning_effort or {})
 
     async def complete(
         self,
@@ -48,34 +60,32 @@ class OpenAITextModel:
         max_output_tokens: int,
     ) -> ModelResult[SchemaT]:
         try:
-            response = await self._client.responses.parse(
+            response = await self._client.responses.create(
                 model=model,
                 input=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                text_format=output_type,
+                text={"format": structured_output_format(output_type)},
                 max_output_tokens=max_output_tokens,
                 store=False,
+                reasoning=self._reasoning(model),
             )
         except OpenAIError as exc:
             raise ProviderError("OpenAI structured model call failed") from exc
-        except ValidationError:
-            # The SDK parses output text inside parse(), so a truncated reply fails here. Its error
-            # embeds partial model output, so it is replaced rather than chained.
-            raise ProviderResponseError("OpenAI structured output was invalid") from None
         if response.status == "incomplete":
             reason = getattr(response.incomplete_details, "reason", "unknown")
             msg = f"OpenAI response was incomplete: {reason}"
             raise ProviderResponseError(msg)
-        if response.output_parsed is None:
-            msg = "OpenAI returned no parsed structured output"
+        if not response.output_text:
+            msg = "OpenAI returned no structured output"
             raise ProviderResponseError(msg)
 
         try:
-            parsed = output_type.model_validate(response.output_parsed)
-        except ValidationError as exc:
-            raise ProviderResponseError("OpenAI output failed schema validation") from exc
+            parsed = output_type.model_validate_json(response.output_text)
+        except ValidationError:
+            # Validation errors embed the model's output, so the error is replaced, not chained.
+            raise ProviderResponseError("OpenAI structured output was invalid") from None
         return ModelResult(
             value=parsed,
             model=response.model,
@@ -83,6 +93,43 @@ class OpenAITextModel:
             usage=_response_usage(response.usage),
             request_id=getattr(response, "_request_id", None),
         )
+
+    def _reasoning(self, model: str) -> Reasoning | Omit:
+        effort = self._reasoning_effort.get(model)
+        return omit if effort is None else Reasoning(effort=cast(ReasoningEffort, effort))
+
+
+def structured_output_format(
+    output_type: type[BaseModel],
+) -> ResponseFormatTextJSONSchemaConfigParam:
+    """Return the strict JSON-schema response format for a Pydantic output model.
+
+    Strict mode requires every property and rejects ``default``, so defaults are removed from the
+    SDK's strict schema. The defaults still apply when the application builds models itself.
+    """
+
+    return ResponseFormatTextJSONSchemaConfigParam(
+        type="json_schema",
+        name=output_type.__name__,
+        schema=_without_defaults(to_strict_json_schema(output_type)),
+        strict=True,
+    )
+
+
+def _without_defaults(node: Any) -> Any:
+    if isinstance(node, list):
+        return [_without_defaults(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    return {
+        key: (
+            {name: _without_defaults(schema) for name, schema in value.items()}
+            if key in _NAMED_SUBSCHEMAS and isinstance(value, dict)
+            else _without_defaults(value)
+        )
+        for key, value in node.items()
+        if key != "default"
+    }
 
 
 class OpenAIEmbeddingProvider:

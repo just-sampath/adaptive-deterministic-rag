@@ -33,6 +33,13 @@ class ContentMode(StrEnum):
     METADATA_ONLY = "metadata_only"
 
 
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+
+def _default_reasoning_effort() -> dict[str, ReasoningEffort]:
+    return {"gpt-5.6-luna": "low"}
+
+
 class ConfigModel(BaseModel):
     """Reject misspelled or obsolete keys in committed YAML configuration."""
 
@@ -100,6 +107,8 @@ class AIConfig(ConfigModel):
     embedding_dimension: int = Field(default=1536, ge=1)
     max_output_tokens: int = Field(default=4096, ge=128)
     max_retries: int = Field(default=2, ge=0, le=10)
+    # Reasoning effort per model name; models not listed use the provider default.
+    reasoning_effort: dict[str, ReasoningEffort] = Field(default_factory=_default_reasoning_effort)
 
 
 class SparseEncoderName(StrEnum):

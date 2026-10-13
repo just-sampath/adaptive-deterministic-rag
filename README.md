@@ -44,6 +44,7 @@ putting speculative code in the current runtime.
 | `src/db/` | Collection declarations, physical vector index naming, and idempotent startup initialization |
 | `src/utils/` | Settings, prompts, logging, errors, and task-local request context |
 | `scripts/seed_dummy_data.py` | The only dummy-data/vector writer; local development only |
+| `scripts/smoke_live_providers.py` | One live call per provider operation; checks keys, models, and schemas |
 | `tests/` | Unit, boundary, concurrency, and in-memory Qdrant tests |
 
 Python modules use snake_case even where the conceptual folder name is “search strategies.”
@@ -107,35 +108,79 @@ DEBUG_TOKEN=replace-this-debug-token
 TELEMETRY_HASH_KEY=replace-this-telemetry-key
 ```
 
+Model calls use OpenAI Structured Outputs in strict mode. The provider sends each output model's
+schema with its defaults removed, because strict mode rejects `default`; the defaults still apply
+when the application builds those models itself. `ai.reasoning_effort` maps a model name to the
+reasoning effort sent with its calls (default: `gpt-5.6-luna: low`). Models not listed use the
+provider default. Reasoning tokens count against `ai.max_output_tokens`.
+
 There is no model-price table. Traces record provider-reported token usage and provider request IDs
 from API responses. They do not invent a dollar cost when a provider response does not contain one.
 
 ## Local development
 
-Requirements: `uv`, Docker Compose, and Python 3.13.9.
+Requirements: `uv`, Docker Compose, and Python 3.13.9. Run these steps in order.
 
-```bash
-uv python install 3.13.9
-uv sync --frozen --all-groups
-cp .env.example .env
-```
+1. Install dependencies and create `.env`:
 
-Add valid OpenAI and Cohere keys and replace the placeholder `AUTH_SHARED_TOKEN`, `DEBUG_TOKEN`, and
-`TELEMETRY_HASH_KEY` values in `.env`. Start the backing stores and API:
+   ```bash
+   uv python install 3.13.9
+   uv sync --frozen --all-groups
+   cp .env.example .env
+   ```
 
-```bash
-docker compose up -d mongo qdrant
-uv run --frozen uvicorn server:app --app-dir src --host 0.0.0.0 --port 8000
-```
+   Add valid OpenAI and Cohere keys and replace the placeholder `AUTH_SHARED_TOKEN`, `DEBUG_TOKEN`,
+   and `TELEMETRY_HASH_KEY` values. `.env.example` sets `APP_ENV=local`, which the seed script
+   requires.
 
-Or run the complete stack:
+2. Confirm that your keys can reach every configured model. The script makes one live call per
+   operation (embedding, rerank, follow-up detection, contextualization, query recovery, generation,
+   and both evaluators), prints one line each, and exits non-zero if any fails. It needs no
+   database.
 
-```bash
-docker compose up --build
-```
+   ```bash
+   PYTHONPATH=src uv run --frozen python scripts/smoke_live_providers.py
+   ```
 
-The compose file sets `APP_ENV=local` for this local stack only. OpenAPI is available at
-`http://localhost:8000/docs`.
+3. Start the backing stores:
+
+   ```bash
+   docker compose up -d mongo qdrant
+   ```
+
+4. Seed the local handbook (see [Local dummy seed](#local-dummy-seed)). Until this runs, the index
+   is empty and every query ends in `INSUFFICIENT_EVIDENCE`.
+
+   ```bash
+   PYTHONPATH=src uv run --frozen python scripts/seed_dummy_data.py \
+     --tenant-id local-tenant --user-id local-admin
+   ```
+
+5. Start the API on the host:
+
+   ```bash
+   uv run --frozen uvicorn server:app --app-dir src --host 0.0.0.0 --port 8000
+   ```
+
+   Or run the API in Docker as well. The compose file sets `APP_ENV=local` and points the API at the
+   `mongo` and `qdrant` services; the seed from step 4 is already in their volumes.
+
+   ```bash
+   docker compose up --build
+   ```
+
+6. Send the [example query](#routes). The seed grants the `reader` and `administrator` roles in
+   `local-tenant`, which matches the example headers. OpenAPI is available at
+   `http://localhost:8000/docs`.
+
+If the first run fails:
+
+| Symptom | Cause and fix |
+| --- | --- |
+| A smoke-test line shows `FAIL` | The key cannot use that model, or the model rejects the configured reasoning effort. Change the model, or remove it from `ai.reasoning_effort`. |
+| Startup reports that `adaptive_rag_chunks` uses the legacy layout | A collection from an older version has the alias name. Delete it (or the `qdrant-data` volume) and seed again. |
+| Startup reports that the alias points to another collection | The embedding model, dimension, sparse settings, or vector names changed. The seed script runs the same check, so delete the alias first (locally, deleting the `qdrant-data` volume also works), then seed again; it creates the new physical collection and points the alias at it. See [Retrieval index](#retrieval-index). |
+| Every answer is `INSUFFICIENT_EVIDENCE` | The index is empty, or the request's tenant or roles do not match the seeded document. |
 
 ## Routes
 
@@ -176,15 +221,11 @@ curl -sS http://localhost:8000/v1/rag/query \
 
 Production source contains no vector write operation. The sole writer is the fixed, idempotent
 local seed script, and it refuses to run unless `APP_ENV=local`. There is no HTTP seed route. Run it
-directly:
-
-```bash
-PYTHONPATH=src uv run --frozen python scripts/seed_dummy_data.py \
-  --tenant-id local-tenant --user-id local-admin
-```
+directly, as in step 4 of [Local development](#local-development).
 
 It creates the physical collection and alias when they are missing, writes dense embeddings and
-BM25 sparse vectors, and links chunks in sequence.
+BM25 sparse vectors, and links chunks in sequence. It uses the same encoder settings as the API, so
+both resolve to the same physical collection.
 
 ## Retrieval index
 

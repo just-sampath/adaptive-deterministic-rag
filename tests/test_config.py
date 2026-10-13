@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
@@ -285,6 +286,8 @@ async def test_mongo_client_applies_operation_timeout_separately_from_server_sel
     try:
         assert client.options.timeout == 1.5
         assert client.options.server_selection_timeout == 3.0
+        assert client.codec_options.tz_aware
+        assert client.codec_options.tzinfo is UTC
     finally:
         await client.close()
 

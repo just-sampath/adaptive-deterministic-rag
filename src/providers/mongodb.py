@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from typing import Any
 
 from pymongo import AsyncMongoClient
@@ -22,4 +23,7 @@ def build_mongo_client(
         serverSelectionTimeoutMS=server_selection_timeout_ms,
         timeoutMS=operation_timeout_ms,
         uuidRepresentation="standard",
+        # Stored datetimes are UTC; read them back timezone-aware so traces keep their offset.
+        tz_aware=True,
+        tzinfo=UTC,
     )

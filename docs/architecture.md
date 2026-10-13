@@ -43,6 +43,8 @@ flowchart TD
 - `scripts/seed_dummy_data.py` is a second, gated local-development exception: it refuses to run
   outside `APP_ENV=local` and composes its own clients. No file under `src/` writes Qdrant points or
   imports `scripts`; `tests/test_seed_boundary.py` enforces both with an AST scan.
+- `scripts/smoke_live_providers.py` composes the OpenAI and Cohere adapters directly to make one
+  live call per operation. It reads and writes no stored data.
 
 ## Async lifecycle and concurrent requests
 
