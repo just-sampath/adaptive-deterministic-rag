@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib
 import logging
 from collections.abc import Iterator
 
@@ -227,3 +228,25 @@ def test_configure_logging_mutes_the_transport_logger_the_installed_openai_sdk_u
     for sdk_logger in (_logs.logger, _logs.httpx2_logger):
         assert sdk_logger.name in _PAYLOAD_LOGGERS
         assert logging.getLogger(sdk_logger.name).getEffectiveLevel() == logging.WARNING
+
+
+# httpx2 sends requests through these httpcore2 modules; each logs request traces at DEBUG.
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        pytest.param("httpcore2._async.connection", id="connection"),
+        pytest.param("httpcore2._async.http11", id="http11"),
+        pytest.param("httpcore2._async.http2", id="http2"),
+        pytest.param("httpcore2._async.http_proxy", id="http-proxy"),
+    ],
+)
+@pytest.mark.usefixtures("restore_logging")
+def test_configure_logging_mutes_the_installed_httpcore2_transport_loggers(
+    module_name: str,
+) -> None:
+    transport_logger = importlib.import_module(module_name).logger
+
+    configure_logging("DEBUG")
+
+    assert transport_logger.name.partition(".")[0] in _PAYLOAD_LOGGERS
+    assert transport_logger.getEffectiveLevel() == logging.WARNING
