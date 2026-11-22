@@ -144,8 +144,10 @@ An empty rewrite falls back to the literal question.
 
 `CONTEXT_ISOLATION` is eligible only when conversation facts exist; it reuses the previous evidence
 and omits those facts. The first unused eligible strategy runs; when none remains, the request
-finalizes. Each attempt records its retry decision (hypothesis, next strategy, drift score, reason)
-and failure labels derived from the failed verdicts; passing attempts carry no failure labels.
+finalizes. The last failed record of each strategy try carries the retry decision (hypothesis, next
+strategy, drift score, reason) and failure labels derived from the failed verdicts. A repaired try
+produces two records; the retry decision and labels go on the repair record, so the pre-repair
+record has neither, even though it failed. Passing attempts carry no failure labels.
 
 A verified partial answer needs faithful claims, at least one verified source, and at least one
 answered requirement. Among partials, more answered requirements wins, then fewer unanswered ones.

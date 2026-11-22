@@ -38,6 +38,7 @@ putting speculative code in the current runtime.
 | `src/middleware/` | Concurrency-safe ASGI request context and request telemetry |
 | `src/handlers/` | RAG orchestration and deterministic policy |
 | `src/handlers/search_strategies/` | One module per bounded search try |
+| `src/models/` | Domain models, request/response shapes, model output schemas, and trace records; imports no other application package |
 | `src/services/` | Reusable application services and provider-facing protocols |
 | `src/providers/` | OpenAI, Cohere, MongoDB, and Qdrant client adapters, and the BM25 sparse encoder |
 | `src/managers/` | All normal runtime MongoDB and Qdrant operations |
@@ -46,6 +47,8 @@ putting speculative code in the current runtime.
 | `scripts/seed_dummy_data.py` | The only dummy-data/vector writer; local development only |
 | `scripts/smoke_live_providers.py` | One live call per provider operation; checks keys, models, and schemas |
 | `tests/` | Unit, boundary, concurrency, and in-memory Qdrant tests |
+| `eval/` | Example offline evaluation fixtures: a golden question set and ranking-metric inputs |
+| `docs/` | Architecture and dependency rules, and the adversarial review record |
 
 Python modules use snake_case even where the conceptual folder name is “search strategies.”
 
@@ -88,7 +91,7 @@ rejects any of the three that is shorter than 32 characters or equal to another 
 Production also requires `https://` for each endpoint that receives a credential: `OPENAI_BASE_URL`
 when `OPENAI_API_KEY` is set, `COHERE_BASE_URL` when `COHERE_API_KEY` is set, and `QDRANT_URL` when
 `QDRANT_API_KEY` is set. A `MONGODB_URI` that carries a username or password must use
-`mongodb+srv://` or request TLS with `tls=true`.
+`mongodb+srv://` or request TLS with `tls=true` (or `ssl=true`).
 
 The complete environment surface is:
 
@@ -298,6 +301,9 @@ uv run mypy
 uv run pytest --cov --cov-report=term-missing
 uv pip check
 ```
+
+CI (`.github/workflows/ci.yml`) runs the first five on every push and pull request, with ruff over
+the whole repository. Run `uv pip check` locally; CI does not.
 
 See [docs/architecture.md](docs/architecture.md) for dependency rules and
 [docs/adversarial-review.md](docs/adversarial-review.md) for the completed review loop.

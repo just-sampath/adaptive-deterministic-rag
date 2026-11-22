@@ -30,8 +30,8 @@ This record captures the failure hypotheses tested and the resulting safeguards.
 
 | Attack or failure hypothesis | Result |
 |---|---|
-| Production code writes to the vector database | A source-tree regression asserts no `.upsert(` under `src/` |
-| The local seed endpoint is accidentally exposed in production | Route registration is opt-in and settings reject the gate outside `APP_ENV=local` |
+| Production code writes to the vector database | An AST scan of `src/` rejects calls to any Qdrant point-writing method and checks that list against the installed client; it also rejects any import of `scripts` |
+| Local seeding is reachable in production | There is no HTTP seed route; the seed script is the only writer and refuses to run unless `APP_ENV=local` |
 | A stale price table reports false monetary cost | Removed; traces retain only provider-reported usage/request identifiers |
 | OTel remains as a hidden runtime or deployment dependency | Removed from code, dependencies, Compose, and configuration |
 | A corrupt reranker score poisons ordering | Non-finite and out-of-range Cohere scores are rejected |
@@ -50,6 +50,10 @@ uv run pytest --cov --cov-report=term-missing
 uv pip check
 python -m compileall -q src scripts
 ```
+
+CI (`.github/workflows/ci.yml`) runs the first five checks on every push and pull request, with
+ruff over the whole repository. `uv pip check` and `compileall` are local checks that CI does not
+run.
 
 Live provider credentials and production datasets are deliberately not part of repository tests.
 Deployment should still run a startup/readiness smoke test against its actual MongoDB, Qdrant,
