@@ -9,8 +9,16 @@ from typing import Any
 
 _STRUCTURED_FIELDS = ("request_id", "request_ids", "tenant_id", "event_type", "error_code")
 # SDK loggers can emit prompts and payloads at DEBUG, so they never go below WARNING. The
-# OpenAI SDK sends requests through the "httpx2" transport logger, not "httpx".
-_PAYLOAD_LOGGERS = ("openai", "httpx", "httpx2", "httpcore", "pymongo", "qdrant_client")
+# OpenAI SDK sends requests through the "httpx2" and "httpcore2" transport loggers.
+_PAYLOAD_LOGGERS = (
+    "openai",
+    "httpx",
+    "httpx2",
+    "httpcore",
+    "httpcore2",
+    "pymongo",
+    "qdrant_client",
+)
 
 
 class JsonFormatter(logging.Formatter):

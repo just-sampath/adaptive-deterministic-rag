@@ -30,7 +30,15 @@ from utils.logging import configure_logging
 from utils.settings import ContentMode, TelemetryConfig
 
 _HASH_KEY = b"test-telemetry-key"
-_PAYLOAD_LOGGERS = ("openai", "httpx", "httpx2", "httpcore", "pymongo", "qdrant_client")
+_PAYLOAD_LOGGERS = (
+    "openai",
+    "httpx",
+    "httpx2",
+    "httpcore",
+    "httpcore2",
+    "pymongo",
+    "qdrant_client",
+)
 
 
 def make_service(mode: ContentMode, key: bytes = _HASH_KEY) -> TelemetryService:
