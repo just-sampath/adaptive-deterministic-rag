@@ -20,25 +20,17 @@ rules. This file holds the rules and conventions that aren't obvious from the co
    over them without asking.
 5. **Never run commands that discard work:** `git clean`, `git stash -u`, `git reset --hard`,
    `git checkout -- .`, force-push. Untracked files here can be someone's only copy.
-6. **Never send real data to a live service.** Tests use the fakes in `tests/fakes.py` and an
-   in-memory Qdrant client, and make no network calls. `scripts/smoke_live_providers.py` spends the
-   owner's OpenAI and Cohere credit, and `scripts/seed_dummy_data.py` writes to the local stores; run
-   either only when the user asks. A check against a real provider key or a deployed database is the
-   owner's step.
-7. **Never invent facts:** no model names, prices, token costs, benchmark or evaluation results,
+6. **Never invent facts:** no model names, prices, token costs, benchmark or evaluation results,
    latency figures, provider limits or provider API behavior you haven't checked. There is no
    model-price table on purpose, and traces record only what provider responses report. Ask, or
    leave the claim out.
-8. **No new outbound services.** At runtime the service talks only to its configured providers:
-   OpenAI, Cohere, MongoDB and Qdrant. Don't add analytics, tracing or error-reporting services
-   (Langfuse and OpenTelemetry are intentionally not used) or any other third-party request.
-9. **Commit and PR text is plain and written as the owner would write it.** One imperative sentence
+7. **Commit and PR text is plain and written as the owner would write it.** One imperative sentence
    as the subject, then a short body that says why, matching the existing history. Never mention AI
    tools or assistants, and never add `Co-Authored-By` or "generated with" lines.
-10. **If your environment can't write inside `.git`,** say so and carry on with the file changes.
-    Don't work around it; the user creates the branch or commit.
-11. **Stay in scope.** Fix what you were asked to fix. Report other problems you notice; don't
-    change them.
+8. **If your environment can't write inside `.git`,** say so and carry on with the file changes.
+   Don't work around it; the user creates the branch or commit.
+9. **Stay in scope.** Fix what you were asked to fix. Report other problems you notice; don't change
+   them.
 
 ## Commands
 
@@ -66,12 +58,7 @@ There is no separate build step. `docker compose up --build` builds and runs the
 - **Facts about providers** (model names, API parameters, Structured Outputs schema rules, Qdrant
   and Cohere behavior) come from the provider's official documentation or the installed SDK, and
   are re-read when you change them. Say in your report which source you read.
-- **Don't decide legal questions** (data retention periods, privacy law, data residency). Build the
-  place for the setting and flag what's missing.
-- **Docs describe what the code does now.** Don't present planned or speculative features as
-  implemented.
-- **Writing:** plain and direct, short sentences, American spelling. No hype words, no exclamation
-  marks, no "guaranteed".
+- **Writing reads as a person wrote it,** not an AI.
 - **List every user-facing text change in your report** as before → after: prompts, API error
   messages, answer disclosures and other text a caller or model sees.
 
@@ -113,8 +100,6 @@ There is no separate build step. `docker compose up --build` builds and runs the
 - **Stable values go in YAML, not environment variables.** The environment holds only secrets,
   external endpoints and deployment selection. Propose a YAML value before a new environment
   variable.
-- **No new runtime dependencies** unless the task is impossible without one. Say why if you add one.
-  Don't add a test framework or pytest plugin; extend the existing suite.
 - **Concurrency must stay safe.** No mutable shared per-request state: request data lives in locals
   or `ContextVar`s. Every external call has a timeout from the `timeouts` settings. Run concurrent
   work through `run_pair` and `run_all` in `utils/concurrency.py`. The container owns every client
@@ -159,12 +144,35 @@ There is no separate build step. `docker compose up --build` builds and runs the
   `.env.example` sets `APP_ENV=local`. Don't remove these guards.
 - Keep measurements, evaluation runs and other scratch output out of the repository.
 
-## Plans
+## Plans: FeatureScopes and ImplementedFeatures
 
 Larger work arrives as a plan: a Markdown file the owner points you to. Plans are not kept in the
-repository; never stage or commit them. Read the whole plan, and any brief it points to, before
-changing anything. Plans say what to change, what done looks like and which rules apply; working out
-how is your job. Where a plan and this file disagree, follow the plan and say so.
+repository. They live in two folders in the repository root, and neither is ever staged or
+committed.
+
+| Folder | Holds | Git |
+| --- | --- | --- |
+| `FeatureScopes/` | Work not yet done: feature scopes, implementation plans, briefs shared by several plans, mock-ups, reviews waiting for action | Untracked; never stage it (or add it to `.gitignore`) |
+| `ImplementedFeatures/` | Finished work: the scopes, plans and briefs of features that have shipped, kept for reference | In `.gitignore` |
+
+- **These files can be the only copy.** They are not on the remote. Never delete, overwrite or clean
+  them up without asking.
+- **One folder per piece of work.** A single plan can be one file. Work with several phases, a
+  shared brief or mock-ups gets its own folder (`<yyyy-mm-dd>-<topic>/` or `<topic>/`), so it moves
+  as one piece.
+- **Reading a plan.** Read the whole plan, and any brief it points to, before changing anything.
+  Plans say what to change, what done looks like and which rules apply; working out how is your job.
+  Where a plan and this file disagree, follow the plan and say so.
+- **Writing a plan.** Write it so another agent with no context from your session can build from it
+  directly: the goal and what done looks like, the files to change and in what order, the rules
+  that apply, the traps you found while reading the code, the tests each step affects, and what to
+  do when blocked on a decision only the owner can make. Several phases share one brief rather than
+  repeating it.
+- **Finishing.** Once the work has shipped, or when the owner says so, move its file or folder from
+  `FeatureScopes/` to `ImplementedFeatures/` and note at the top what shipped (with the commit) and
+  what was left undone.
+- **Nothing in the repository links to either folder.** Code, README and tests must not depend on
+  them.
 
 ## Documentation upkeep
 
