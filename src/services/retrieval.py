@@ -20,6 +20,7 @@ from models.domain import (
     SearchHit,
 )
 from services.contracts import DocumentReader, QueryEncoder, TextModel, VectorSearch
+from services.understanding import query_drift_score
 from utils.concurrency import run_all
 from utils.prompts import QUERY_RECOVERY_SYSTEM, query_recovery_user_prompt
 from utils.settings import FusionStrategy, RetrievalConfig
@@ -85,9 +86,14 @@ class QueryRecoveryService:
                 output_type=QueryRecoveryOutput,
                 max_output_tokens=self._max_output_tokens,
             )
-        primary = _distinct(
-            (query.canonical_question, query.literal_question, result.value.keyword_query)
-        )[: self._max_variants]
+        # A rewritten follow-up whose words all survived the rewrite ("what about the second
+        # one?") adds nothing as a search of its own. When the rewrite dropped some of the user's
+        # words, the literal text is the one variant that still carries them.
+        literal_adds_words = query_drift_score(query.literal_question, query.canonical_question) > 0
+        literal = query.literal_question if not query.rewritten or literal_adds_words else None
+        primary = _distinct((query.canonical_question, literal, result.value.keyword_query))[
+            : self._max_variants
+        ]
         decomposed = _distinct(result.value.decomposed_queries, exclude=primary)[
             : self._max_decomposed_queries
         ]

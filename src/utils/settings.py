@@ -152,7 +152,7 @@ class RetrievalConfig(ConfigModel):
     max_query_variants: int = Field(default=4, ge=1, le=10)
     max_decomposed_queries: int = Field(default=3, ge=0, le=10)
     query_variant_concurrency: int = Field(default=4, ge=1, le=20)
-    query_drift_threshold: float = Field(default=0.55, ge=0, le=1)
+    query_drift_threshold: float = Field(default=0.5, ge=0, le=1)
     embedding_cache_entries: int = Field(default=1000, ge=0)
 
     @model_validator(mode="after")

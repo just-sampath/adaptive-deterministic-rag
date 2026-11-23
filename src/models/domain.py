@@ -255,12 +255,10 @@ class FaithfulnessEvaluation(FrozenModel):
     correcting_chunks: tuple[str, ...] = ()
     confidence: float = Field(ge=0, le=1)
 
-    @model_validator(mode="after")
-    def consistent_status(self) -> FaithfulnessEvaluation:
-        if self.passed != (self.failure_type is FaithfulnessStatus.SUPPORTED):
-            msg = "Faithfulness passed flag and status disagree"
-            raise ValueError(msg)
-        return self
+    @model_validator(mode="before")
+    @classmethod
+    def passed_follows_status(cls, data: Any) -> Any:
+        return _passed_from_status(data, FaithfulnessStatus.SUPPORTED)
 
 
 class RequirementEvaluation(FrozenModel):
@@ -277,12 +275,21 @@ class CompletenessEvaluation(FrozenModel):
     missing_information_available: bool = False
     confidence: float = Field(ge=0, le=1)
 
-    @model_validator(mode="after")
-    def consistent_status(self) -> CompletenessEvaluation:
-        if self.passed != (self.failure_type is CompletenessStatus.COMPLETE):
-            msg = "Completeness passed flag and status disagree"
-            raise ValueError(msg)
-        return self
+    @model_validator(mode="before")
+    @classmethod
+    def passed_follows_status(cls, data: Any) -> Any:
+        return _passed_from_status(data, CompletenessStatus.COMPLETE)
+
+
+def _passed_from_status(data: Any, passing: StrEnum) -> Any:
+    """Derive ``passed`` from ``failure_type`` so a judge's flag can never disagree with it.
+
+    The strict output schema cannot tie the two fields together, so the status wins.
+    """
+
+    if not isinstance(data, dict) or "failure_type" not in data:
+        return data
+    return {**data, "passed": data["failure_type"] == passing.value}
 
 
 class ModelUsage(FrozenModel):

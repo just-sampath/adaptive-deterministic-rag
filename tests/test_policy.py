@@ -32,7 +32,8 @@ from tests.fakes import make_chunk
 from utils.settings import PolicyConfig, RetrievalConfig
 
 CANONICAL = "Explain product B migration limitations"
-DRIFTED_LITERAL = "What about product A?"
+# The rewrite drops "A" and "pricing", two of the literal's three content words.
+DRIFTED_LITERAL = "What about product A pricing?"
 FACT = "Product A was selected."
 HAPPY = RetrievalStrategy.HAPPY_PATH
 RECALL = RetrievalStrategy.RECALL_EXPANSION
@@ -157,7 +158,29 @@ def test_drifted_literal_question_selects_query_recovery() -> None:
 
     assert decision.hypothesis is RetryHypothesis.QUERY_DRIFT
     assert decision.next_strategy is RECOVERY
-    assert decision.drift_score == pytest.approx(0.875)
+    assert decision.drift_score == pytest.approx(2 / 3)
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    [
+        pytest.param(
+            "What about product pricing?", RetryHypothesis.QUERY_DRIFT, id="one-of-two-dropped"
+        ),
+        pytest.param(
+            "What about product migration pricing?",
+            RetryHypothesis.GENERATION_ONLY,
+            id="one-of-three-dropped",
+        ),
+    ],
+)
+def test_default_drift_threshold_counts_half_the_words_dropped_as_drift(
+    literal: str,
+    expected: RetryHypothesis,
+) -> None:
+    decision = decide(make_state(literal=literal), evaluation())
+
+    assert decision.hypothesis is expected
 
 
 def test_no_supported_material_with_evidence_is_query_drift() -> None:
@@ -631,6 +654,29 @@ def test_missing_gap_list_defaults_to_the_canonical_question() -> None:
     best = state.best_verified_answer
     assert best is not None
     assert best.unanswered_requirements == (CANONICAL,)
+
+
+@pytest.mark.parametrize(
+    ("faithfulness", "completeness", "repairable"),
+    [
+        pytest.param(UNSUPPORTED, COMPLETE, True, id="unsupported-claim"),
+        pytest.param(CONTRADICTED, COMPLETE, True, id="contradicted-claim"),
+        pytest.param(NO_MATERIAL, COMPLETE, False, id="no-supported-material"),
+        pytest.param(UNSUPPORTED, MISSING_EVIDENCE, False, id="missing-retrieval-evidence"),
+        pytest.param(UNSUPPORTED, NOT_ANSWERABLE, False, id="hallucinated-unanswerable"),
+        pytest.param(CONTRADICTED, NOT_ANSWERABLE, False, id="contradicted-unanswerable"),
+    ],
+)
+def test_claims_to_remove_are_repairable_without_correcting_evidence(
+    faithfulness: FaithfulnessStatus,
+    completeness: CompletenessStatus,
+    repairable: bool,
+) -> None:
+    policy = DecisionPolicy(policy=PolicyConfig(), retrieval=RetrievalConfig())
+    result = evaluation(faithfulness=faithfulness, completeness=completeness, requirements=())
+
+    assert result.faithfulness.correcting_evidence_available is False
+    assert policy.can_repair(make_state(), result) is repairable
 
 
 def test_generation_repair_is_global_and_bounded() -> None:

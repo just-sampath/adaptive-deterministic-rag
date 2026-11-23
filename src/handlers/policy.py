@@ -80,6 +80,12 @@ class DecisionPolicy:
         return evaluation.faithfulness.passed and evaluation.completeness.passed
 
     def can_repair(self, state: RagState, evaluation: EvaluationResult) -> bool:
+        """Repair answers the evidence can fix: omitted content, or claims to remove or correct.
+
+        Removing unsupported claims only helps an answer that is otherwise complete; when the
+        question isn't answerable from the evidence, a later strategy needs the single repair more.
+        """
+
         faithfulness = evaluation.faithfulness
         completeness = evaluation.completeness
         return (
@@ -87,6 +93,10 @@ class DecisionPolicy:
             and (
                 completeness.failure_type is CompletenessStatus.MISSING_ANSWER_CONTENT
                 or faithfulness.correcting_evidence_available
+                or (
+                    faithfulness.failure_type in _UNSUPPORTED
+                    and completeness.failure_type is CompletenessStatus.COMPLETE
+                )
             )
             and completeness.failure_type is not CompletenessStatus.MISSING_RETRIEVAL_EVIDENCE
             and faithfulness.failure_type is not FaithfulnessStatus.NO_SUPPORTED_MATERIAL_CLAIMS

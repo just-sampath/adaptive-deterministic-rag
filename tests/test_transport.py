@@ -260,6 +260,27 @@ def test_unhandled_error_is_500_with_request_id_in_response_and_events(
     assert completed[0].attributes["error_code"] == "RuntimeError"
 
 
+def test_unhandled_error_is_answered_and_logged_once_without_reaching_the_server(
+    make_settings: Callable[..., Settings],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app = make_app(make_context(make_settings()))
+
+    @app.get("/boom")
+    async def boom() -> None:
+        raise RuntimeError("unexpected")
+
+    # The default client re-raises anything that escapes to the server; nothing should.
+    with caplog.at_level(logging.ERROR):
+        response = TestClient(app).get("/boom")
+
+    failures = [record for record in caplog.records if record.getMessage() == "Request failed"]
+    assert response.status_code == 500
+    assert response.json()["error"] == "INTERNAL_ERROR"
+    assert len(response.headers.get_list("x-request-id")) == 1
+    assert len(failures) == 1
+
+
 def test_validation_failure_is_logged_by_type_without_the_model_text(
     make_settings: Callable[..., Settings],
     caplog: pytest.LogCaptureFixture,

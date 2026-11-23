@@ -9,21 +9,10 @@ from collections.abc import Mapping, Sequence
 
 from models.domain import SparseEmbedding
 from utils.settings import SparseConfig
+from utils.text import ENGLISH_STOPWORDS
 
 _TOKEN = re.compile(r"\w+(?:[.:/-]\w+)*")
 _SEPARATOR = re.compile(r"[._:/-]")
-_STOPWORDS = frozenset(
-    word
-    for line in (
-        "a all also although am an and any are as at be because been before being below between",
-        "both but by can could did do does doing down during each few for from further had has",
-        "have having he her here hers him his how i if in into is it its just me my of off on once",
-        "or our out over she should so some such than that the their them then there these they",
-        "this those through to too under until up very was we were what when where which while who",
-        "why will with would you your",
-    )
-    for word in line.split()
-)
 
 
 class Bm25SparseEncoder:
@@ -75,7 +64,7 @@ def _terms(text: str) -> list[str]:
     terms: list[str] = []
     for match in _TOKEN.finditer(text.casefold()):
         token = match.group()
-        if token not in _STOPWORDS:
+        if token not in ENGLISH_STOPWORDS:
             terms.append(token)
         if _SEPARATOR.search(token):
             terms.extend(part for part in _SEPARATOR.split(token) if _keep_part(part))
@@ -83,7 +72,7 @@ def _terms(text: str) -> list[str]:
 
 
 def _keep_part(part: str) -> bool:
-    return part not in _STOPWORDS and (len(part) >= 2 or part.isdigit())
+    return part not in ENGLISH_STOPWORDS and (len(part) >= 2 or part.isdigit())
 
 
 def _sparse(weights: Mapping[int, float]) -> SparseEmbedding:

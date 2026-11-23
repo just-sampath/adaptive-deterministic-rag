@@ -24,10 +24,50 @@ from services.contracts import FollowupDetector, TextModel
 from utils.errors import InfrastructureError
 from utils.prompts import CONTEXTUALIZER_SYSTEM, contextualization_user_prompt
 from utils.settings import ContextualizationConfig
+from utils.text import ENGLISH_STOPWORDS
 
 logger = logging.getLogger(__name__)
 
-_WORD = re.compile(r"[A-Za-z0-9_:-]+")
+_WORD = re.compile(r"\w+(?:[-:]\w+)*")
+_PART_SEPARATOR = re.compile(r"[-:_]")
+_ORDINAL = re.compile(r"\d+(?:st|nd|rd|th)")
+# Contractions fold back to their head word so "what's" and "isn't" don't leave fragments behind.
+_CONTRACTIONS = (
+    (re.compile(r"\bcan['\u2019]t\b", re.IGNORECASE), "can"),
+    (re.compile(r"\bwon['\u2019]t\b", re.IGNORECASE), "will"),
+    (re.compile(r"n['\u2019]t\b", re.IGNORECASE), ""),
+    (re.compile(r"['\u2019](?:s|re|ve|ll|d|m)\b", re.IGNORECASE), ""),
+)
+# Words a follow-up uses to point at earlier turns; a rewrite replaces them, so losing them isn't
+# drift.
+_REFERENCE_WORDS = frozenset(
+    {
+        "about",
+        "above",
+        "another",
+        "first",
+        "former",
+        "it",
+        "its",
+        "last",
+        "latter",
+        "next",
+        "one",
+        "ones",
+        "other",
+        "previous",
+        "same",
+        "second",
+        "similar",
+        "that",
+        "them",
+        "these",
+        "they",
+        "third",
+        "this",
+        "those",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,13 +79,74 @@ class UnderstandingResult:
 
 
 def query_drift_score(literal: str, canonical: str) -> float:
-    """Measure deterministic token-set divergence for retry prioritization."""
+    """Return the share of the literal message's content terms the canonical question dropped.
 
-    literal_terms = {term.lower() for term in _WORD.findall(literal)}
-    canonical_terms = {term.lower() for term in _WORD.findall(canonical)}
-    if not literal_terms and not canonical_terms:
+    Resolving a reference ("the second one") loses no content and scores 0; a rewrite that drops
+    what the user actually named scores higher. A message without content terms scores 0.
+    """
+
+    literal_terms = _content_terms(literal)
+    if not literal_terms:
         return 0
-    return 1 - len(literal_terms & canonical_terms) / len(literal_terms | canonical_terms)
+    canonical_terms = _all_terms(canonical)
+    dropped = [term for term in literal_terms if not _covered(term, canonical_terms)]
+    return len(dropped) / len(literal_terms)
+
+
+def _tokens(text: str) -> list[str]:
+    for pattern, replacement in _CONTRACTIONS:
+        text = pattern.sub(replacement, text)
+    return _WORD.findall(text)
+
+
+def _content_terms(text: str) -> set[str]:
+    # In an all-caps message capitals mark nothing, so no word is kept as an identifier for them.
+    shouting = not any(character.islower() for character in text)
+    terms: set[str] = set()
+    for position, token in enumerate(_tokens(text)):
+        term = token.casefold()
+        if _ORDINAL.fullmatch(term):
+            continue
+        if _is_identifier(token, first=position == 0, shouting=shouting) or (
+            term not in ENGLISH_STOPWORDS
+            and term not in _REFERENCE_WORDS
+            and (len(term) > 1 or term.isdigit())
+        ):
+            terms.add(term)
+    return terms
+
+
+def _all_terms(text: str) -> set[str]:
+    """Return every word of the text, plus the parts of hyphenated or joined words."""
+
+    terms: set[str] = set()
+    for token in _tokens(text):
+        term = token.casefold()
+        terms.add(term)
+        terms.update(part for part in _PART_SEPARATOR.split(term) if part)
+    return terms
+
+
+def _covered(term: str, canonical_terms: set[str]) -> bool:
+    if term in canonical_terms:
+        return True
+    parts = [part for part in _PART_SEPARATOR.split(term) if part]
+    return bool(parts) and all(part in canonical_terms for part in parts)
+
+
+def _is_identifier(word: str, *, first: bool, shouting: bool) -> bool:
+    """Keep names the stopword list would drop: "product A", "EU", "v2".
+
+    A capital letter opening the message ("A similar one?") is an article, not a name.
+    """
+
+    if any(character.isdigit() for character in word):
+        return True
+    if shouting:
+        return False
+    if len(word) == 1:
+        return word.isupper() and word != "I" and not first
+    return word.isalpha() and word.isupper()
 
 
 class QueryUnderstandingService:

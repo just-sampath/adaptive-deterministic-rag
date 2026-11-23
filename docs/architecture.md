@@ -89,8 +89,11 @@ MongoDB startup:
 1. pings the server;
 2. creates missing application, conversation, telemetry, and trace collections;
 3. ensures tenant, identity, current-version, and sequence indexes;
-4. ensures trace and event TTL indexes;
-5. fails startup on an incompatible existing index.
+4. ensures trace and event TTL indexes. A longer retention is applied to an existing TTL index in
+   place with `collMod`, which needs a role beyond `readWrite` (such as `dbAdmin`) on the
+   database. A shorter retention fails startup, because lowering a TTL deletes stored records;
+   apply it by hand with `collMod`;
+5. fails startup on any other incompatible existing index.
 
 Qdrant startup works on a physical collection named `<collection_alias>__<digest>`. The digest
 covers the query encoder fingerprint, the distance, the sparse IDF setting, the vector names, and
@@ -116,7 +119,7 @@ Queries and readiness checks always address the alias.
 | Follow-up detected in the conversation | Rewrite into a standalone canonical question |
 | Initial request | Run `HAPPY_PATH` |
 | Evaluators both pass | Return `COMPLETE` with sanitized verified sources and citations |
-| Correctable generation failure and repair unused | Repair once, then reevaluate |
+| Correctable generation failure and repair unused | Repair once, then reevaluate. Correctable means the answer omitted content the evidence holds, correcting evidence exists, or an otherwise complete answer has unsupported or contradicted claims to remove; never when the evidence lacks a requirement or no material claim is supported |
 | Any other failure | Classify a retry hypothesis and run its next unused strategy |
 | Budget spent and a verified partial answer exists | Return `VERIFIED_PARTIAL` with a disclosure |
 | No answer with verified support | Return `INSUFFICIENT_EVIDENCE` |
@@ -136,11 +139,23 @@ An empty rewrite falls back to the literal question.
 | Hypothesis | Signal | Strategy preference |
 |---|---|---|
 | `CONTEXT_CONTAMINATION` | Conversation facts were used and claims are unsupported or contradicted | `CONTEXT_ISOLATION` |
-| `QUERY_DRIFT` | Literal/canonical drift above threshold, evidence present but no supported claim, or several requirements with missing evidence | `QUERY_RECOVERY`, `RECALL_EXPANSION` |
+| `QUERY_DRIFT` | Drift score at or above `query_drift_threshold`, evidence present but no supported claim, or several requirements with missing evidence | `QUERY_RECOVERY`, `RECALL_EXPANSION` |
 | `NOT_ANSWERABLE` | Completeness judges the question not answerable | `RECALL_EXPANSION` |
 | `LOW_RECALL` | No evidence, or a missing requirement absent from the evidence | `RECALL_EXPANSION`, `QUERY_RECOVERY` |
 | `GENERATION_ONLY` | Evidence was present but the answer omitted it or added unsupported claims | `CONTEXT_ISOLATION` if conversation facts exist |
 | `UNCLASSIFIED` | None of the above | `RECALL_EXPANSION`, `QUERY_RECOVERY`, `CONTEXT_ISOLATION` |
+
+The drift score is the share of the literal message's content words that the canonical question
+dropped. Stopwords and the words a follow-up uses to point back ("it", "that", "one", "second",
+"about") don't count; identifiers do ("product A", "EU", "v2"). Resolving a reference therefore
+scores 0. At the default `query_drift_threshold` of 0.5, dropping one of two content words is
+drift, and dropping one of three (0.33) is not. When a rewritten question is recovered, the literal
+text is searched as its own variant only if the rewrite dropped some of its content words.
+
+The judges' `passed` flag always follows their status (`SUPPORTED`, `COMPLETE`): the strict output
+schema cannot tie the two fields together, so a disagreeing flag is overridden rather than failing
+the request. A verdict that passes the answer while listing unsupported or contradicted claims, or
+a missing requirement, is treated as a failure of that kind.
 
 `CONTEXT_ISOLATION` is eligible only when conversation facts exist; it reuses the previous evidence
 and omits those facts. The first unused eligible strategy runs; when none remains, the request
@@ -217,7 +232,12 @@ a bounded time for the writer to flush, then cancels it. Queue saturation, sink 
 server-side request failures (deadline, timeout, provider, unexpected) produce structured stderr
 logs with request IDs, and those failures also emit `http.request.failed`; client errors appear in
 `http.request.completed` with their status code. Validation failures are logged by type only, so
-rejected input is not echoed. SDK loggers that can print payloads are held at `WARNING`. There is
+rejected input is not echoed. The request middleware answers an unexpected error itself instead of
+re-raising it to the server, so the failure is logged once; an error raised after the response has
+started is still re-raised and also logged by uvicorn. In a single uvicorn process, uvicorn's
+startup and access logs go through the same JSON handler; the supervisor that `--reload` or
+`--workers` starts logs its own lines in uvicorn's plain-text format. Access logs carry the client
+address and the request path with its query string. SDK loggers that can print payloads are held at `WARNING`. There is
 no OpenTelemetry dependency or collector.
 
 Trace reads require the debug token. A trace is visible only within the caller's tenant, to the

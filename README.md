@@ -43,7 +43,7 @@ putting speculative code in the current runtime.
 | `src/providers/` | OpenAI, Cohere, MongoDB, and Qdrant client adapters, and the BM25 sparse encoder |
 | `src/managers/` | All normal runtime MongoDB and Qdrant operations |
 | `src/db/` | Collection declarations, physical vector index naming, and idempotent startup initialization |
-| `src/utils/` | Settings, prompts, logging, errors, and task-local request context |
+| `src/utils/` | Settings, prompts, logging, errors, shared word lists, and task-local request context |
 | `scripts/seed_dummy_data.py` | The only dummy-data/vector writer; local development only |
 | `scripts/smoke_live_providers.py` | One live call per provider operation; checks keys, models, and schemas |
 | `tests/` | Unit, boundary, concurrency, and in-memory Qdrant tests |
@@ -268,7 +268,10 @@ verified partial answer.
 The FastAPI lifespan owns all shared asynchronous clients. Startup concurrently initializes the
 two independent stores, creates missing MongoDB collections, ensures all MongoDB indexes and TTLs,
 creates the physical Qdrant collection, its payload indexes, and the alias when absent, and rejects
-an incompatible existing vector schema.
+an incompatible existing vector schema. A longer `mongodb.trace_retention_days` or
+`telemetry_retention_days` is applied to the existing TTL index on the next startup with
+`collMod`, which needs a role beyond `readWrite` (such as `dbAdmin`) on the database. A shorter one
+stops startup, because lowering a TTL deletes stored records; apply it by hand with `collMod`.
 
 One bounded telemetry service captures HTTP events, RAG attempt events, errors, provider usage, and
 detailed request traces. Its sink is a small protocol; MongoDB is the only implementation today.
@@ -277,8 +280,12 @@ drains the queue within `telemetry.shutdown_timeout_seconds` before the external
 
 Trace text follows `telemetry.content_mode`. `redacted` (the default) stores lengths and
 HMAC-SHA256 digests keyed by `TELEMETRY_HASH_KEY`, `metadata_only` stores lengths only, and `full`
-stores text. Application logs are structured JSON on stderr. Queue saturation and sink failures are
-logged there with the affected request IDs. OpenTelemetry is not used.
+stores text. Application logs are structured JSON on stderr, and an unexpected error is logged once
+unless it happens after the response has started. In a single uvicorn process, uvicorn's startup
+and access logs are JSON too; the supervisor that `--reload` or `--workers` starts logs in plain
+text. Access logs include the client address and the request path with its query string. Queue
+saturation and sink failures are logged there
+with the affected request IDs. OpenTelemetry is not used.
 
 ## Extension boundaries
 

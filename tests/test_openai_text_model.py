@@ -99,6 +99,53 @@ async def test_reply_text_is_validated_as_the_requested_schema() -> None:
     assert await _complete(model) == GenerationDraft(answer="Advantages.")
 
 
+@pytest.mark.parametrize(
+    ("output_type", "reply", "passed"),
+    [
+        pytest.param(
+            FaithfulnessEvaluation,
+            '{"passed": true, "failure_type": "UNSUPPORTED_CLAIMS", "confidence": 0.9}',
+            False,
+            id="faithfulness-flag-passes-a-failure",
+        ),
+        pytest.param(
+            FaithfulnessEvaluation,
+            '{"passed": false, "failure_type": "SUPPORTED", "confidence": 0.9}',
+            True,
+            id="faithfulness-flag-fails-a-pass",
+        ),
+        pytest.param(
+            CompletenessEvaluation,
+            '{"passed": true, "failure_type": "MISSING_ANSWER_CONTENT", "confidence": 0.9}',
+            False,
+            id="completeness-flag-passes-a-failure",
+        ),
+        pytest.param(
+            CompletenessEvaluation,
+            '{"passed": false, "failure_type": "COMPLETE", "confidence": 0.9}',
+            True,
+            id="completeness-flag-fails-a-pass",
+        ),
+    ],
+)
+async def test_judge_flag_that_disagrees_with_its_status_follows_the_status(
+    output_type: type[FaithfulnessEvaluation | CompletenessEvaluation],
+    reply: str,
+    passed: bool,
+) -> None:
+    model, _ = _model(_reply(reply))
+
+    result = await model.complete(
+        model="gpt-test",
+        system_prompt="system",
+        user_prompt="user",
+        output_type=output_type,
+        max_output_tokens=64,
+    )
+
+    assert result.value.passed is passed
+
+
 async def test_request_sends_a_strict_schema_and_no_storage() -> None:
     model, responses = _model(_reply('{"answer": "Advantages."}'))
 

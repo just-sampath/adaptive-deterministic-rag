@@ -17,6 +17,8 @@ def main() -> None:
         host=settings.app.host,
         port=settings.app.port,
         log_level=settings.app.log_level.lower(),
+        # create_app already configured JSON logging; uvicorn's default config would replace it.
+        log_config=None,
     )
 
 

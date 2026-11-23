@@ -275,6 +275,45 @@ async def test_decomposed_queries_have_their_own_budget() -> None:
     assert variants.values == ("canonical", "literal", "first", "second")
 
 
+@pytest.mark.parametrize(
+    ("literal", "canonical", "expected"),
+    [
+        pytest.param(
+            "What about the second one?",
+            "What is the audit log retention?",
+            ("What is the audit log retention?", "keywords", "first"),
+            id="resolved-reference-is-dropped",
+        ),
+        pytest.param(
+            "What about product A pricing?",
+            "Explain product B migration limitations",
+            (
+                "Explain product B migration limitations",
+                "What about product A pricing?",
+                "keywords",
+                "first",
+            ),
+            id="literal-with-dropped-words-is-kept",
+        ),
+    ],
+)
+async def test_rewritten_follow_up_literal_is_searched_only_when_it_adds_words(
+    literal: str, canonical: str, expected: tuple[str, ...]
+) -> None:
+    model = FakeTextModel()
+    model.queue(
+        QueryRecoveryOutput,
+        QueryRecoveryOutput(keyword_query="keywords", decomposed_queries=("first",)),
+    )
+    query = QueryUnderstanding(
+        literal_question=literal, canonical_question=canonical, rewritten=True
+    )
+
+    variants = await _recovery(model).build(query)
+
+    assert variants.values == expected
+
+
 async def test_variants_are_stripped_deduplicated_and_blank_values_dropped() -> None:
     model = FakeTextModel()
     model.queue(

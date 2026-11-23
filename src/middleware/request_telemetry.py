@@ -7,9 +7,11 @@ from time import perf_counter
 from typing import Protocol, cast
 from uuid import uuid4
 
+from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from handlers.contracts import TransportTelemetry
+from routes.exceptions import unexpected_error_response
 from utils.request_context import bind_request, current_identity, reset_request
 
 _REQUEST_ID_HEADER = b"x-request-id"
@@ -37,10 +39,12 @@ class RequestTelemetryMiddleware:
         started = perf_counter()
         status_code = 500
         error_code: str | None = None
+        response_started = False
 
         async def send_with_request_id(message: Message) -> None:
-            nonlocal status_code
+            nonlocal status_code, response_started
             if message["type"] == "http.response.start":
+                response_started = True
                 status_code = message["status"]
                 message["headers"] = _with_request_id(message.get("headers", ()), request_id)
             await send(message)
@@ -49,7 +53,13 @@ class RequestTelemetryMiddleware:
             await self._app(scope, receive, send_with_request_id)
         except Exception as exc:
             error_code = type(exc).__name__
-            raise
+            if response_started:
+                raise
+            # Answer here rather than re-raising: Starlette's outer error middleware re-raises
+            # after responding, and the server would then log the failure a second time with its
+            # full message, which can quote rejected input.
+            response = unexpected_error_response(Request(scope), exc)
+            await response(scope, receive, send_with_request_id)
         finally:
             identity = current_identity()
             telemetry = cast(_TelemetryHost, scope["app"].state.container).telemetry

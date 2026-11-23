@@ -16,6 +16,7 @@ from models.domain import (
     RankedChunk,
     RequirementEvaluation,
     RequirementStatus,
+    UnsupportedClaim,
 )
 from services.contracts import TextModel
 from services.evaluation import (
@@ -243,6 +244,87 @@ async def test_model_declared_question_not_answerable_is_kept() -> None:
     )
 
     assert result.completeness.failure_type is CompletenessStatus.QUESTION_NOT_ANSWERABLE
+
+
+@pytest.mark.parametrize(
+    ("available", "expected"),
+    [
+        pytest.param(True, CompletenessStatus.MISSING_ANSWER_CONTENT, id="left-out-of-answer"),
+        pytest.param(False, CompletenessStatus.MISSING_RETRIEVAL_EVIDENCE, id="not-in-evidence"),
+    ],
+)
+async def test_completeness_pass_with_a_missing_requirement_is_a_failure(
+    available: bool,
+    expected: CompletenessStatus,
+) -> None:
+    model = FakeTextModel()
+    model.queue(FaithfulnessEvaluation, _supported("E1"))
+    model.queue(
+        CompletenessEvaluation,
+        CompletenessEvaluation(
+            passed=True,
+            failure_type=CompletenessStatus.COMPLETE,
+            requirements=(
+                RequirementEvaluation(
+                    requirement="limitations",
+                    status=RequirementStatus.MISSING,
+                    available_in_context=available,
+                    supporting_chunks=("E1",) if available else (),
+                ),
+            ),
+            confidence=0.9,
+        ),
+    )
+
+    result = await _evaluator(model).evaluate(
+        question="Question", answer="Answer", context=_context()
+    )
+
+    assert result.completeness.passed is False
+    assert result.completeness.failure_type is expected
+
+
+@pytest.mark.parametrize(
+    ("unsupported", "contradicted", "expected"),
+    [
+        pytest.param(("B",), (), FaithfulnessStatus.UNSUPPORTED_CLAIMS, id="unsupported"),
+        pytest.param((), ("A",), FaithfulnessStatus.CONTRADICTED_CLAIMS, id="contradicted"),
+        pytest.param(("B",), ("A",), FaithfulnessStatus.CONTRADICTED_CLAIMS, id="both"),
+    ],
+)
+async def test_faithfulness_pass_that_lists_failed_claims_is_a_failure(
+    unsupported: tuple[str, ...],
+    contradicted: tuple[str, ...],
+    expected: FaithfulnessStatus,
+) -> None:
+    model = FakeTextModel()
+    model.queue(
+        FaithfulnessEvaluation,
+        FaithfulnessEvaluation(
+            passed=True,
+            failure_type=FaithfulnessStatus.SUPPORTED,
+            verified_sources=("E1",),
+            unsupported_claims=tuple(UnsupportedClaim(claim=claim) for claim in unsupported),
+            contradicted_claims=tuple(
+                ContradictedClaim(claim=claim, evidence_chunk_ids=("E1",)) for claim in contradicted
+            ),
+            confidence=0.9,
+        ),
+    )
+    model.queue(
+        CompletenessEvaluation,
+        CompletenessEvaluation(
+            passed=True, failure_type=CompletenessStatus.COMPLETE, confidence=0.9
+        ),
+    )
+
+    result = await _evaluator(model).evaluate(
+        question="Question", answer="Answer [E1].", context=_context()
+    )
+
+    assert result.faithfulness.passed is False
+    assert result.faithfulness.failure_type is expected
+    assert result.faithfulness.verified_sources == (CHUNK_ID,)
 
 
 async def test_contradicted_claim_evidence_and_correcting_labels_map_to_chunk_ids() -> None:

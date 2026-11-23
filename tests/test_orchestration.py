@@ -704,13 +704,20 @@ async def test_contaminated_generation_is_retried_in_isolation_without_repeating
             relevant_conversation_context=("The user asked about migration earlier.",),
         ),
     )
+    # The unsupported claim is repaired first; the repair still fails, so isolation runs.
     model.queue(
         GenerationDraft,
         GenerationDraft(answer="Advantages from the earlier turn [E1]."),
+        GenerationDraft(answer="Advantages, still from the earlier turn [E1]."),
         GenerationDraft(answer="Advantages [E1]."),
     )
-    model.queue(FaithfulnessEvaluation, _unsupported(), _supported())
-    model.queue(CompletenessEvaluation, _complete_evaluation(), _complete_evaluation())
+    model.queue(FaithfulnessEvaluation, _unsupported(), _unsupported(), _supported())
+    model.queue(
+        CompletenessEvaluation,
+        _complete_evaluation(),
+        _complete_evaluation(),
+        _complete_evaluation(),
+    )
     vector_store = hit_store()
     orchestrator = build_orchestrator(
         model=model,
@@ -727,12 +734,111 @@ async def test_contaminated_generation_is_retried_in_isolation_without_repeating
     assert response.status is ResultStatus.COMPLETE
     trace = repository.traces[response.request_id]
     assert trace.attempted_strategies == (HAPPY, CONTEXT_ISOLATION)
-    assert trace.attempts[0].decision is not None
-    assert trace.attempts[0].decision.hypothesis is RetryHypothesis.CONTEXT_CONTAMINATION
+    assert [attempt.generation_repair_attempted for attempt in trace.attempts] == [
+        False,
+        True,
+        False,
+    ]
+    repair_decision = trace.attempts[1].decision
+    assert repair_decision is not None
+    assert repair_decision.hypothesis is RetryHypothesis.CONTEXT_CONTAMINATION
     assert vector_store.search_calls == 1
-    first, second = _generation_payloads(model)
+    first, repair, isolated = _generation_payloads(model)
     assert first["relevant_conversation_facts"] == ["The user asked about migration earlier."]
-    assert second["relevant_conversation_facts"] == []
+    assert "relevant_conversation_facts" not in repair
+    assert isolated["relevant_conversation_facts"] == []
+
+
+async def test_unsupported_claim_without_correcting_evidence_is_repaired_instead_of_abstaining(
+    identity: Identity,
+) -> None:
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    model.queue(
+        GenerationDraft,
+        GenerationDraft(answer="Advantages [E1]. It is also free."),
+        GenerationDraft(answer="Advantages [E1]."),
+    )
+    model.queue(FaithfulnessEvaluation, _unsupported(), _supported())
+    model.queue(CompletenessEvaluation, _complete_evaluation(), _complete_evaluation())
+    orchestrator = build_orchestrator(model=model, repository=repository, vector_store=hit_store())
+
+    response = await orchestrator.query(identity, QueryRequest(message="Explain the feature"))
+
+    assert response.status is ResultStatus.COMPLETE
+    assert response.metadata.generation_repaired
+    assert response.answer == "Advantages [1]."
+    trace = repository.traces[response.request_id]
+    assert trace.attempted_strategies == (HAPPY,)
+
+
+async def test_hallucinated_answer_to_unanswerable_question_keeps_the_repair_for_later(
+    identity: Identity,
+) -> None:
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    model.queue(
+        GenerationDraft,
+        GenerationDraft(answer="Invented details [E1]."),
+        GenerationDraft(answer="Advantages [E1]."),
+        GenerationDraft(answer="Advantages and limits [E1]."),
+    )
+    not_answerable = CompletenessEvaluation(
+        passed=False, failure_type=CompletenessStatus.QUESTION_NOT_ANSWERABLE, confidence=1
+    )
+    missing_content = CompletenessEvaluation(
+        passed=False,
+        failure_type=CompletenessStatus.MISSING_ANSWER_CONTENT,
+        requirements=(
+            RequirementEvaluation(
+                requirement="limits",
+                status=RequirementStatus.MISSING,
+                available_in_context=True,
+                supporting_chunks=("E1",),
+            ),
+        ),
+        confidence=1,
+    )
+    model.queue(FaithfulnessEvaluation, _unsupported(), _supported(), _supported())
+    model.queue(CompletenessEvaluation, not_answerable, missing_content, _complete_evaluation())
+    orchestrator = build_orchestrator(model=model, repository=repository, vector_store=hit_store())
+
+    response = await orchestrator.query(identity, QueryRequest(message="Explain the feature"))
+
+    assert response.status is ResultStatus.COMPLETE
+    assert response.metadata.generation_repaired
+    trace = repository.traces[response.request_id]
+    assert trace.attempted_strategies == (HAPPY, RECALL)
+    assert [attempt.generation_repair_attempted for attempt in trace.attempts] == [
+        False,
+        False,
+        True,
+    ]
+
+
+async def test_judge_flag_that_disagrees_with_its_status_does_not_fail_the_request(
+    identity: Identity,
+) -> None:
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    model.queue(
+        GenerationDraft,
+        GenerationDraft(answer="Advantages [E1]. It is also free."),
+        GenerationDraft(answer="Advantages [E1]."),
+    )
+    # The judge says it passed while reporting unsupported claims: read as a failure, then repaired.
+    disagreeing = FaithfulnessEvaluation.model_validate_json(
+        '{"passed": true, "failure_type": "UNSUPPORTED_CLAIMS",'
+        ' "verified_sources": ["E1"], "confidence": 0.9}'
+    )
+    model.queue(FaithfulnessEvaluation, disagreeing, _supported())
+    model.queue(CompletenessEvaluation, _complete_evaluation(), _complete_evaluation())
+    orchestrator = build_orchestrator(model=model, repository=repository, vector_store=hit_store())
+
+    response = await orchestrator.query(identity, QueryRequest(message="Explain the feature"))
+
+    assert response.status is ResultStatus.COMPLETE
+    assert response.metadata.generation_repaired
 
 
 async def test_failed_repair_is_evaluated_and_its_attempt_carries_the_retry_decision(

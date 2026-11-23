@@ -68,7 +68,7 @@ retrieval:
   max_query_variants: 4
   max_decomposed_queries: 3
   query_variant_concurrency: 4
-  query_drift_threshold: 0.55
+  query_drift_threshold: 0.5
   embedding_cache_entries: 1000
 
 contextualization:

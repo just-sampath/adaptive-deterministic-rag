@@ -19,6 +19,7 @@ _PAYLOAD_LOGGERS = (
     "pymongo",
     "qdrant_client",
 )
+_SERVER_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
 
 
 class JsonFormatter(logging.Formatter):
@@ -48,3 +49,9 @@ def configure_logging(level: str) -> None:
     root.setLevel(level.upper())
     for name in _PAYLOAD_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+    # The uvicorn CLI installs its own plain-text handlers before the app is imported; send its
+    # startup and access logs through the JSON handler instead.
+    for name in _SERVER_LOGGERS:
+        server_logger = logging.getLogger(name)
+        server_logger.handlers.clear()
+        server_logger.propagate = True

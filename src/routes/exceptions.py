@@ -62,8 +62,14 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def unhandled_error(request: Request, exc: Exception) -> JSONResponse:
-        _record_failure(request, exc)
-        return _error_response(request, 500, "INTERNAL_ERROR", "An unexpected error occurred")
+        return unexpected_error_response(request, exc)
+
+
+def unexpected_error_response(request: Request, exc: Exception) -> JSONResponse:
+    """Record an unexpected failure once and return the stable 500 response."""
+
+    _record_failure(request, exc)
+    return _error_response(request, 500, "INTERNAL_ERROR", "An unexpected error occurred")
 
 
 def _validation_details(exc: RequestValidationError) -> list[dict[str, Any]]:

@@ -123,10 +123,114 @@ def prompted_history(model: RecordingTextModel) -> list[str]:
     return list(payload["conversation_history"])
 
 
-def test_drift_score_is_zero_for_identical_terms_and_positive_for_divergence() -> None:
-    assert query_drift_score("product A limits", "product A limits") == 0
-    assert query_drift_score("product A limits", "product B limits") > 0
-    assert query_drift_score("", "") == 0
+@pytest.mark.parametrize(
+    ("literal", "canonical", "score"),
+    [
+        pytest.param(
+            "What about the second one?",
+            "What is the retention period for administrator audit logs?",
+            0,
+            id="resolved-selection",
+        ),
+        pytest.param(
+            "And for contractors?",
+            "What is the laptop policy for contractors?",
+            0,
+            id="kept-content-word",
+        ),
+        pytest.param(
+            "How long are traces kept?",
+            "How long are RAG request traces kept in MongoDB?",
+            0,
+            id="expanded-question",
+        ),
+        pytest.param(
+            "What is the refund policy for EU customers?",
+            "What is the refund policy?",
+            0.5,
+            id="dropped-content",
+        ),
+        pytest.param(
+            "What about product A?",
+            "Explain product B migration limitations",
+            0.5,
+            id="replaced-identifier",
+        ),
+        pytest.param(
+            "What changed in v2?",
+            "What changed in the latest release?",
+            0.5,
+            id="replaced-versioned-identifier",
+        ),
+        pytest.param(
+            "What should I do about it?",
+            "What should the user do about the expired token?",
+            0,
+            id="pronoun-i-is-not-an-identifier",
+        ),
+        pytest.param(
+            "What's that one?",
+            "What is the retention period for administrator audit logs?",
+            0,
+            id="contraction-s",
+        ),
+        pytest.param(
+            "Isn\u2019t that one free?",
+            "Is the premium plan free?",
+            0,
+            id="curly-apostrophe-negation",
+        ),
+        pytest.param(
+            "Doesn't it apply to contractors?",
+            "Does the laptop policy apply to contractors?",
+            0,
+            id="negated-contraction",
+        ),
+        pytest.param(
+            "WHAT ABOUT THE SECOND ONE?",
+            "What is the retention period for administrator audit logs?",
+            0,
+            id="all-caps-message",
+        ),
+        pytest.param(
+            "A similar one for contractors?",
+            "What is the laptop policy for contractors?",
+            0,
+            id="opening-article-a",
+        ),
+        pytest.param(
+            "What about the 2nd one?",
+            "What is the retention period for audit logs?",
+            0,
+            id="ordinal",
+        ),
+        pytest.param(
+            "And the next one?",
+            "What is the retention period for telemetry events?",
+            0,
+            id="next-one",
+        ),
+        pytest.param(
+            "What about the follow-up?",
+            "What is the follow up process for audits?",
+            0,
+            id="hyphenated-word-split-in-rewrite",
+        ),
+        pytest.param(
+            "What about the IT department?",
+            "What is the laptop policy for the finance department?",
+            0.5,
+            id="all-caps-name-kept",
+        ),
+        pytest.param("product A limits", "product A limits", 0, id="identical"),
+        pytest.param("", "", 0, id="empty"),
+        pytest.param("What is this?", "What is the audit policy?", 0, id="no-content-terms"),
+    ],
+)
+def test_drift_score_is_the_share_of_content_words_the_rewrite_dropped(
+    literal: str, canonical: str, score: float
+) -> None:
+    assert query_drift_score(literal, canonical) == pytest.approx(score)
 
 
 async def test_disabled_contextualization_never_calls_detector_or_model() -> None:

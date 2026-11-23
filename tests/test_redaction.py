@@ -40,6 +40,7 @@ _PAYLOAD_LOGGERS = (
     "pymongo",
     "qdrant_client",
 )
+_SERVER_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
 
 
 def make_service(mode: ContentMode, key: bytes = _HASH_KEY) -> TelemetryService:
@@ -116,11 +117,18 @@ def restore_logging() -> Iterator[None]:
     saved_handlers = root.handlers[:]
     saved_level = root.level
     saved_payload_levels = {name: logging.getLogger(name).level for name in _PAYLOAD_LOGGERS}
+    saved_server_loggers = {
+        name: (logging.getLogger(name).handlers[:], logging.getLogger(name).propagate)
+        for name in _SERVER_LOGGERS
+    }
     yield
     root.handlers[:] = saved_handlers
     root.setLevel(saved_level)
     for name, level in saved_payload_levels.items():
         logging.getLogger(name).setLevel(level)
+    for name, (handlers, propagate) in saved_server_loggers.items():
+        logging.getLogger(name).handlers[:] = handlers
+        logging.getLogger(name).propagate = propagate
 
 
 @pytest.mark.parametrize("mode", [ContentMode.REDACTED, ContentMode.METADATA_ONLY])
@@ -228,6 +236,20 @@ def test_configure_logging_mutes_the_transport_logger_the_installed_openai_sdk_u
     for sdk_logger in (_logs.logger, _logs.httpx2_logger):
         assert sdk_logger.name in _PAYLOAD_LOGGERS
         assert logging.getLogger(sdk_logger.name).getEffectiveLevel() == logging.WARNING
+
+
+@pytest.mark.usefixtures("restore_logging")
+def test_configure_logging_routes_uvicorn_logs_through_the_json_handler() -> None:
+    plain = logging.StreamHandler()
+    for name in _SERVER_LOGGERS:
+        logging.getLogger(name).addHandler(plain)
+        logging.getLogger(name).propagate = False
+
+    configure_logging("INFO")
+
+    for name in _SERVER_LOGGERS:
+        assert logging.getLogger(name).handlers == []
+        assert logging.getLogger(name).propagate is True
 
 
 # httpx2 sends requests through these httpcore2 modules; each logs request traces at DEBUG.

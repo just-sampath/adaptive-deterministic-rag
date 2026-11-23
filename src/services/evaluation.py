@@ -175,7 +175,14 @@ def _sanitize_faithfulness(
         item.model_copy(update={"evidence_chunk_ids": _resolve(item.evidence_chunk_ids, chunk_ids)})
         for item in evaluation.contradicted_claims
     )
-    if evaluation.passed and not verified:
+    # A judge that passes the answer while listing claims it couldn't support has failed it.
+    failure = evaluation.failure_type
+    if evaluation.passed and contradicted:
+        failure = FaithfulnessStatus.CONTRADICTED_CLAIMS
+    elif evaluation.passed and evaluation.unsupported_claims:
+        failure = FaithfulnessStatus.UNSUPPORTED_CLAIMS
+    passed = failure is FaithfulnessStatus.SUPPORTED
+    if passed and not verified:
         return evaluation.model_copy(
             update={
                 "passed": False,
@@ -188,6 +195,8 @@ def _sanitize_faithfulness(
         )
     return evaluation.model_copy(
         update={
+            "passed": passed,
+            "failure_type": failure,
             "verified_sources": verified,
             "correcting_chunks": correcting,
             "correcting_evidence_available": bool(correcting)
@@ -212,13 +221,17 @@ def _sanitize_completeness(
             }
         )
     failure = evaluation.failure_type
-    if (
-        not evaluation.passed
-        and requirements
-        and failure is not CompletenessStatus.QUESTION_NOT_ANSWERABLE
-    ):
+    # The missing requirements decide the failure, so a judge that passes the answer while
+    # marking a requirement missing has failed it.
+    if failure is not CompletenessStatus.QUESTION_NOT_ANSWERABLE:
         failure = _missing_failure(requirements, failure)
-    return evaluation.model_copy(update={"failure_type": failure, "requirements": requirements})
+    return evaluation.model_copy(
+        update={
+            "passed": failure is CompletenessStatus.COMPLETE,
+            "failure_type": failure,
+            "requirements": requirements,
+        }
+    )
 
 
 def _resolve_requirement(

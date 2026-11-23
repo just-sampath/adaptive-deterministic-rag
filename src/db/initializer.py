@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Sequence
 from contextlib import suppress
 from typing import Any
 
-from pymongo import AsyncMongoClient
+from pymongo import AsyncMongoClient, IndexModel
+from pymongo.asynchronous.database import AsyncDatabase
 from pymongo.errors import CollectionInvalid, PyMongoError
 from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
@@ -17,6 +20,7 @@ from utils.concurrency import run_pair
 from utils.errors import InfrastructureError, ProviderError, ProviderResponseError
 from utils.settings import MongoConfig
 
+logger = logging.getLogger(__name__)
 _KEYWORD_FIELDS = ("tenant_id", "allowed_roles", "document_id", "document_version_id", "section_id")
 
 
@@ -52,6 +56,7 @@ class DatabaseInitializer:
                 with suppress(CollectionInvalid):
                     await database.create_collection(name)
             for name, indexes in mongo_indexes(self._mongo).items():
+                await _update_changed_ttls(database, name, indexes)
                 await database[name].create_indexes(list(indexes))
         except PyMongoError as exc:
             raise InfrastructureError("MongoDB initialization failed") from exc
@@ -177,3 +182,51 @@ class DatabaseInitializer:
                     f"Qdrant alias {self._index.alias} was created concurrently for another "
                     "collection"
                 ) from exc
+
+
+async def _update_changed_ttls(
+    database: AsyncDatabase[dict[str, Any]],
+    collection: str,
+    indexes: Sequence[IndexModel],
+) -> None:
+    """Apply a longer retention to an existing TTL index in place.
+
+    ``createIndexes`` rejects an existing index name with different options, so a TTL whose key
+    is unchanged gets its new ``expireAfterSeconds`` through ``collMod`` first. Only increases
+    are applied: a shorter retention deletes stored records, and while instances with old and new
+    settings run side by side, applying whichever value started last would flip it back and forth.
+    A decrease stops startup and must be applied by hand. Any other difference is left for
+    ``createIndexes`` to reject.
+    """
+
+    ttls = [index.document for index in indexes if "expireAfterSeconds" in index.document]
+    if not ttls:
+        return
+    cursor = await database[collection].list_indexes()
+    existing = {item["name"]: item async for item in cursor}
+    for wanted in ttls:
+        current = existing.get(wanted["name"])
+        if (
+            current is None
+            or "expireAfterSeconds" not in current
+            or list(current["key"].items()) != list(wanted["key"].items())
+            or current["expireAfterSeconds"] == wanted["expireAfterSeconds"]
+        ):
+            continue
+        name = wanted["name"]
+        old, new = current["expireAfterSeconds"], wanted["expireAfterSeconds"]
+        if new < old:
+            raise InfrastructureError(
+                f"TTL index {name} on {collection} keeps records for {old} seconds, but the "
+                f"settings ask for {new}. Shortening retention deletes stored records, so "
+                f"startup won't apply it; run collMod on {collection} to lower it, or keep the "
+                f"current value"
+            )
+        await database.command(
+            "collMod",
+            collection,
+            index={"name": name, "expireAfterSeconds": new},
+        )
+        logger.warning(
+            "Raised TTL index %s on %s from %s to %s seconds", name, collection, old, new
+        )
