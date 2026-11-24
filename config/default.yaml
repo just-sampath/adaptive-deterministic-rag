@@ -82,6 +82,8 @@ contextualization:
   max_context_characters: 12000
 
 context:
+  tokenizer_encoding: utf8_bytes
+  tokenizer_verified_for: null
   max_tokens: 8000
   max_seed_chunks: 8
   max_document_share: 0.4

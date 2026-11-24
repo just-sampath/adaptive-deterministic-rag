@@ -40,12 +40,13 @@ putting speculative code in the current runtime.
 | `src/handlers/search_strategies/` | One module per bounded search try |
 | `src/models/` | Domain models, request/response shapes, model output schemas, and trace records; imports no other application package |
 | `src/services/` | Reusable application services and provider-facing protocols |
-| `src/providers/` | OpenAI, Cohere, MongoDB, and Qdrant client adapters, and the BM25 sparse encoder |
+| `src/providers/` | OpenAI, Cohere, MongoDB and Qdrant adapters, the BM25 sparse encoder and the offline passage tokenizer |
 | `src/managers/` | All normal runtime MongoDB and Qdrant operations |
 | `src/db/` | Collection declarations, physical vector index naming, and idempotent startup initialization |
 | `src/utils/` | Settings, prompts, logging, errors, shared word lists, and task-local request context |
 | `scripts/seed_dummy_data.py` | The only dummy-data/vector writer; local development only |
 | `scripts/smoke_live_providers.py` | One live call per provider operation; checks keys, models, and schemas |
+| `scripts/prefetch_tokenizer.py` | Prepare the pinned vocabulary for offline evidence packing |
 | `tests/` | Unit, boundary, concurrency, and in-memory Qdrant tests |
 | `eval/` | Example offline evaluation fixtures: a golden question set and ranking-metric inputs |
 | `docs/` | Architecture and dependency rules, and the adversarial review record |
@@ -67,7 +68,21 @@ flowchart TD
 
 Qdrant receives mandatory tenant, role, and active-version filters inside the vector manager.
 MongoDB then rehydrates candidate content and independently rechecks tenant, ACL, deletion state,
-and the authoritative current document version before content enters a prompt.
+and the authoritative current document version. Request metadata filters apply to hydrated seeds
+before reranking and to structural neighbors before packing. Filter keys start with a letter and
+contain only letters, digits, `_` and `-`. A request with any other key, including a dotted path,
+is rejected as invalid. A hit that Qdrant matched but whose MongoDB metadata fails the filters is
+dropped and counted in a `rag.retrieval.metadata_mismatch` event, which signals drift between the
+two stores.
+
+For each passage, packing charges the greater of its stored count and its locally measured size.
+By default the measure is the full UTF-8 byte length. A deployment with a verified
+`o200k_base` mapping can measure ordinary-text tokens instead. The same charge applies to the
+document share and overall budget. An inflated stored count still limits admission.
+The document-share limit applies when at least two documents each have a seed that fits the
+overall budget. Setting `context.max_neighbors_per_seed` to zero skips neighbor lookups.
+The seed estimates its stored count as one per four characters, rounded up. Reranker inputs and
+the rest of the generation prompt are outside this passage budget.
 
 ## Configuration model
 
@@ -85,6 +100,15 @@ from environment variables with no application prefix.
 `default.yaml`; no `dev.yaml` or `prod.yaml` is required. Unknown YAML keys fail startup so a typo
 cannot silently select a default.
 
+| Evidence packing setting | Default | Meaning |
+| --- | --- | --- |
+| `context.tokenizer_encoding` | `utf8_bytes` | Use the full UTF-8 byte length, or select `o200k_base` to count passage tokens offline. |
+| `context.tokenizer_verified_for` | `null` | In tokenizer mode, set the exact `ai.generation_model` value whose encoding you verified. Keep this null in byte mode. |
+
+Confirm the deployed generation model's encoding before enabling tokenizer mode. A model name
+change requires updating the verification setting after checking the new deployment. Compare
+required evidence coverage on held-out questions before enabling this mode in production.
+
 `APP_ENV` defaults to `production` when unset, so a missing value fails closed. Production startup
 rejects the placeholder `AUTH_SHARED_TOKEN`, `DEBUG_TOKEN`, and `TELEMETRY_HASH_KEY` values, and it
 rejects any of the three that is shorter than 32 characters or equal to another of the three.
@@ -99,6 +123,7 @@ The complete environment surface is:
 # Unset APP_ENV means production.
 APP_ENV=local
 CONFIG_DIR=config
+# Evidence packing is configured in YAML with context.tokenizer_encoding and context.tokenizer_verified_for.
 OPENAI_API_KEY=
 OPENAI_BASE_URL=
 COHERE_API_KEY=
@@ -129,8 +154,14 @@ Requirements: `uv`, Docker Compose, and Python 3.13.9. Run these steps in order.
    ```bash
    uv python install 3.13.9
    uv sync --frozen --all-groups
+   uv run --frozen python -m scripts.prefetch_tokenizer
    cp .env.example .env
    ```
+
+   The prefetch command prepares the local vocabulary used by tokenizer mode and its tests.
+   Run it once after installing dependencies on a clean checkout. CI and the Docker build run
+   the same command. Byte-mode startup needs no vocabulary. Tokenizer-mode startup requires
+   a valid local copy and fails if it is missing or corrupt.
 
    Add valid OpenAI and Cohere keys and replace the placeholder `AUTH_SHARED_TOKEN`, `DEBUG_TOKEN`,
    and `TELEMETRY_HASH_KEY` values. `.env.example` sets `APP_ENV=local`, which the seed script
@@ -259,6 +290,11 @@ the whole history, still bounded by that limit.
 Answers cite evidence with numbered markers such as `[1]` or `[1, 2]`. `citations` lists each cited
 passage once, numbered by first appearance. Markers that do not refer to verified evidence are
 removed. Setting `answers.inline_citations: false` removes all markers and returns no citations.
+Before delivery, MongoDB rechecks every packed passage from the selected answer, including
+uncited passages. If a passage is missing, loses eligibility, or changes its model-visible content,
+the API returns `INSUFFICIENT_EVIDENCE` with the literal question as unanswered and empty sources
+and citations. A conversation turn stores the abstention, and a `rag.evidence.withdrawn` event
+records the reason and the status that was selected. A final store failure remains an error.
 Partial answers end with a verification disclosure that lists the unanswered requirements.
 `metadata.degraded` is true when a stage timeout or infrastructure failure was salvaged into a
 verified partial answer.
@@ -299,6 +335,9 @@ with the affected request IDs. OpenTelemetry is not used.
   policies without adding recency behavior now.
 
 ## Quality gates
+
+On a clean checkout, run the vocabulary prefetch command from local development before pytest.
+The tokenizer tests use the local file and block network access during their offline checks.
 
 ```bash
 uv lock --check

@@ -6,7 +6,7 @@ import re
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 
-from models.domain import Chunk, Citation
+from models.domain import Chunk, Citation, Source
 
 # Only evidence labels are markers; bracketed numbers and code indexing such as items[0] are text.
 _MARKER = re.compile(r"([ \t]*)\[\s*(E\d+(?:\s*,\s*E\d+)*)\s*\]")
@@ -32,11 +32,12 @@ class CitationRenderer:
         *,
         evidence: Mapping[str, Chunk],
         verified_chunk_ids: Collection[str],
-        allowed_document_ids: Collection[str],
     ) -> RenderedAnswer:
         usable: dict[str, Chunk] = {}
         if self._inline:
-            usable = _usable_evidence(evidence, verified_chunk_ids, allowed_document_ids)
+            usable = {
+                label: chunk for label, chunk in evidence.items() if chunk.id in verified_chunk_ids
+            }
         numbers = _number_chunks(answer, usable)
         return RenderedAnswer(
             text=_substitute(answer, usable, numbers),
@@ -55,16 +56,22 @@ def _substitute(answer: str, usable: Mapping[str, Chunk], numbers: Mapping[str, 
     return re.sub(rf"{re.escape(site)}+([ \t]*)", _site_separator, marked)
 
 
-def _usable_evidence(
-    evidence: Mapping[str, Chunk],
-    verified_chunk_ids: Collection[str],
-    allowed_document_ids: Collection[str],
-) -> dict[str, Chunk]:
-    return {
-        label: chunk
-        for label, chunk in evidence.items()
-        if chunk.id in verified_chunk_ids and chunk.document_id in allowed_document_ids
-    }
+def sources_from_chunks(chunks: Collection[Chunk]) -> tuple[Source, ...]:
+    """Group freshly authorized, verified chunks in their original verification order."""
+    by_document: dict[str, list[Chunk]] = {}
+    for chunk in chunks:
+        by_document.setdefault(chunk.document_id, []).append(chunk)
+    return tuple(
+        Source(
+            document_id=document_id,
+            title=items[0].document_title,
+            sections=tuple(
+                dict.fromkeys(" > ".join(c.heading_path) for c in items if c.heading_path)
+            ),
+            version=items[0].document_version,
+        )
+        for document_id, items in by_document.items()
+    )
 
 
 def _number_chunks(answer: str, usable: Mapping[str, Chunk]) -> dict[str, int]:

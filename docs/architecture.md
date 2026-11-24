@@ -72,15 +72,22 @@ Every external stage has a timeout: follow-up detection, contextualization, quer
 embedding, retrieval, reranking, generation, and evaluation use the budgets in `timeouts`, and
 MongoDB operations use the client-side `mongodb.operation_timeout_ms`. The handler wraps the
 complete workflow in a global request deadline. Understanding and strategy attempts run under
-`request_seconds - finalization_reserve_seconds`, which leaves time to fetch sources and store the
+`request_seconds - finalization_reserve_seconds`, which leaves time to recheck passages and store the
 conversation turn.
 
 When the attempt deadline expires, or a stage raises `TimeoutError` or `InfrastructureError`, the
-best verified answer found so far is returned as `VERIFIED_PARTIAL` with `metadata.degraded = true`.
+best verified answer found so far goes through final evidence checks before it can be returned as
+`VERIFIED_PARTIAL` with `metadata.degraded = true`.
 Without one, the error is raised unchanged. A nested provider timeout remains an operation timeout;
 only an expired request or attempt deadline is reported as `REQUEST_DEADLINE_EXCEEDED`.
 
 ## Startup initialization
+
+Settings validation accepts `context.tokenizer_encoding: o200k_base` only when
+`context.tokenizer_verified_for` exactly matches `ai.generation_model`. Before constructing
+external clients, the container loads the vocabulary from `.tokenizer/o200k_base.tiktoken`,
+verifies its SHA-256 and constructs the ordinary-text counter once. A missing or corrupt asset
+fails startup. Byte mode skips the asset and requires a null verification setting.
 
 `DatabaseInitializer.ensure_ready` initializes MongoDB and Qdrant concurrently.
 
@@ -118,12 +125,15 @@ Queries and readiness checks always address the alias.
 |---|---|
 | Follow-up detected in the conversation | Rewrite into a standalone canonical question |
 | Initial request | Run `HAPPY_PATH` |
-| Evaluators both pass | Return `COMPLETE` with sanitized verified sources and citations |
+| Evaluators both pass | Select `COMPLETE` for final evidence checks |
 | Correctable generation failure and repair unused | Repair once, then reevaluate. Correctable means the answer omitted content the evidence holds, correcting evidence exists, or an otherwise complete answer has unsupported or contradicted claims to remove; never when the evidence lacks a requirement or no material claim is supported |
 | Any other failure | Classify a retry hypothesis and run its next unused strategy |
-| Budget spent and a verified partial answer exists | Return `VERIFIED_PARTIAL` with a disclosure |
+| Budget spent and a verified partial answer exists | Select the best partial for final evidence checks |
 | No answer with verified support | Return `INSUFFICIENT_EVIDENCE` |
-| Attempt deadline or stage failure after a verified partial | Return `VERIFIED_PARTIAL`, degraded |
+| Attempt deadline or stage failure after a verified partial | Select the best partial for final evidence checks and mark it degraded |
+| All selected passages still match | Present the selected answer, its verified sources and any partial disclosure |
+| A selected passage disappeared, changed or no longer qualifies | Present and save the standard abstention with empty sources and citations |
+| Final evidence read fails or times out | Propagate the operational error |
 | Provider or deadline failure with nothing verified | Raise a typed operational error |
 
 Query understanding is optional (`contextualization.enabled`). With conversation history, the
@@ -195,13 +205,35 @@ stale hits never take a slot. The MongoDB document manager then:
 
 The `active` payload flag is written by the indexer; version currency is enforced in MongoDB.
 
-Only surviving chunks can be reranked, packed into a prompt, or returned as sources. Neighbour
-expansion fetches through the same hydration, accepts only the same document, version, and section,
-places a previous neighbour before its seed and a next neighbour after it, and packs a neighbour only
-with its seed. Prompts present evidence as labels `E1`..`En`, never chunk IDs. Evaluator-cited
-labels are mapped back to the packed chunks and anything unknown is dropped before it is trusted.
-Inline citation markers are numbered only for verified chunks whose documents survive the final
-source lookup.
+Hydrated seeds must also match each request metadata filter before the candidate cutoff and
+reranking. Neighbors pass the same metadata check and must belong to the same document, version
+and section. String, boolean and integer filters use exact typed matches. A float filter matches
+an equal numeric value. Request validation rejects dotted filter keys, because flat scalar chunk
+metadata cannot confirm a nested path. Qdrant already applied the same filters, so a hydrated hit
+that fails them means the payload and MongoDB metadata disagree. The retriever drops it and the
+handler emits `rag.retrieval.metadata_mismatch` with the strategy and the count.
+
+Packing preserves neighbor order and requires its anchor seed to fit. The context builder
+offloads one packing batch, and the packer charges each passage the greater of its declared
+count and the local measurement. The default counter measures UTF-8 bytes. A verified tokenizer
+counts the passage as ordinary text, including any stored header or literal special-token spelling.
+Both the document share and total use this charge. Only documents with a seed
+that individually fits the total budget count toward the share limit. A sole qualifying document
+can use the full budget. A zero neighbor limit returns the deduplicated seeds before any neighbor
+lookup. `PackedContext.token_count` reports the resulting packing units. Provider usage is recorded
+separately.
+
+Before generation, the handler captures each packed chunk ID, document and version ID, and a
+digest covering the text, title, numeric version and ordered headings sent to the model.
+Finalization rehydrates all references for the selected complete, repaired or partial answer in one
+manager call. The manager reads chunks and then current documents in separate queries. Concurrent
+edits can occur after either read. If any dependency is missing, its metadata no longer matches or
+its passage has changed, the handler returns and saves the standard abstention. Otherwise it groups
+the verified subset into public sources and renders citations from the same authorized chunks.
+Prompts use passage labels such as `E1`. The evaluator resolves only known labels to chunk IDs.
+A final read error propagates. The internal verdict and verified chunk IDs remain in the trace.
+A withdrawal emits `rag.evidence.withdrawn` with the reason (`unavailable`, `metadata` or
+`changed`), the selected status, the strategy and the number of packed passages.
 
 ## Telemetry boundary
 
@@ -214,7 +246,7 @@ Two MongoDB collections are used:
 
 | Collection | Content |
 |---|---|
-| `telemetry_events` | Low-cardinality HTTP, attempt, retry-decision, repair, completion, and error events |
+| `telemetry_events` | Low-cardinality HTTP, attempt, retry-decision, repair, metadata-mismatch, evidence-withdrawal, completion, and error events |
 | `rag_request_traces` | Full bounded workflow trace: contextualization, per-list scores and ranks, evaluations, retry decisions, model versions, provider request IDs, and usage |
 
 Trace content is controlled by `telemetry.content_mode`: `full`, `redacted`, or `metadata_only`.
@@ -249,6 +281,7 @@ user who made the request or to the administrator role; any other trace returns 
 |---|---|---|
 | `TextModel` | OpenAI Responses API | Add adapter + resolver branch |
 | `EmbeddingProvider` | OpenAI embeddings | Add adapter + resolver branch |
+| `PassageTokenCounter` | UTF-8 byte length or pinned offline `o200k_base` tokenizer | Verify the deployment mapping and vocabulary before adding an encoding |
 | `SparseEncoder` | In-repo BM25 (`Bm25SparseEncoder`) | Add encoder + `SparseEncoderName` member + resolver branch |
 | `QueryEncoder` | `HybridQueryEncoder` (dense provider + sparse encoder) | A single-pass encoder such as BGE-M3 implements it directly; a new fingerprint means reindexing into a new physical collection, then switching the alias |
 | `VectorSearch` | Qdrant manager | Add manager + resolver branch; the initializer and seed writer are Qdrant-specific too |

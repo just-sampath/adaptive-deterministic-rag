@@ -19,6 +19,7 @@ from models.domain import (
     CompletenessStatus,
     ContextualizationTrace,
     ConversationMessage,
+    EvidenceRef,
     FaithfulnessEvaluation,
     FaithfulnessStatus,
     Identity,
@@ -37,7 +38,7 @@ from models.domain import (
     Source,
     VerifiedAnswer,
 )
-from services.citations import CitationRenderer, RenderedAnswer
+from services.citations import CitationRenderer, RenderedAnswer, sources_from_chunks
 from services.context import ContextBuilder, ContextOutcome
 from services.contracts import ConversationStore, DocumentReader
 from services.evaluation import (
@@ -77,14 +78,11 @@ class _RequestRecord:
 class _Evidence:
     retrieval: RetrievalOutcome
     context: ContextOutcome
+    refs: dict[str, EvidenceRef]
 
     @property
     def available(self) -> bool:
         return bool(self.context.packed_context.chunks)
-
-    @property
-    def labels(self) -> dict[str, Chunk]:
-        return self.context.packed_context.evidence_by_label()
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,13 +162,12 @@ class SearchHandler:
             async with deadline:
                 terminal = await self._answer(record, request, start)
                 record.terminal = terminal
-                sources = await self._documents.get_sources(
-                    terminal.verified_chunk_ids, record.identity
-                )
-                presented = self._present(terminal, sources)
+                outcome = await self._authorize_answer(record, terminal, request)
                 # History keeps plain text so rendered markers never re-enter a later prompt.
                 await self._append_turn(
-                    record.identity, request, self._citations.without_markers(terminal.answer)
+                    record.identity,
+                    request,
+                    self._citations.without_markers(outcome.terminal.answer),
                 )
         except TimeoutError as exc:
             if not deadline.expired():
@@ -178,7 +175,46 @@ class SearchHandler:
             raise RequestDeadlineExceededError(
                 "The RAG request exceeded its global deadline"
             ) from exc
-        return _Outcome(terminal=terminal, sources=sources, presented=presented)
+        return outcome
+
+    async def _authorize_answer(
+        self, record: _RequestRecord, terminal: TerminalResult, request: QueryRequest
+    ) -> _Outcome:
+        refs = terminal.evidence_refs
+        if not refs:
+            return _Outcome(terminal, (), self._present(terminal, {}))
+
+        current = await self._documents.hydrate_authorized_chunks(
+            [ref.chunk_id for ref in refs.values()], record.identity
+        )
+        evidence: dict[str, Chunk] = {}
+        for label, ref in refs.items():
+            chunk = current.get(ref.chunk_id)
+            reason = _withdrawal_reason(ref, chunk, request.filters)
+            if chunk is None or reason is not None:
+                return self._withdraw(record, terminal, request, reason or "unavailable")
+            evidence[label] = chunk
+
+        sources = sources_from_chunks([current[key] for key in terminal.verified_chunk_ids])
+        return _Outcome(terminal, sources, self._present(terminal, evidence))
+
+    def _withdraw(
+        self, record: _RequestRecord, terminal: TerminalResult, request: QueryRequest, reason: str
+    ) -> _Outcome:
+        # The trace keeps the selected verdict; this event records the public downgrade.
+        self._emit(
+            record.request_id,
+            record.identity,
+            "rag.evidence.withdrawn",
+            attributes={
+                "reason": reason,
+                "selected_status": terminal.status.value,
+                "strategy": terminal.strategy.value if terminal.strategy else None,
+                "packed_passages": len(terminal.evidence_refs),
+            },
+        )
+        abstention = _abstain(request.message, terminal.strategy, terminal.generation_repaired)
+        return _Outcome(abstention, (), self._present(abstention, {}))
 
     async def _answer(
         self,
@@ -251,14 +287,13 @@ class SearchHandler:
             ),
         )
 
-    def _present(self, terminal: TerminalResult, sources: tuple[Source, ...]) -> RenderedAnswer:
+    def _present(self, terminal: TerminalResult, evidence: Mapping[str, Chunk]) -> RenderedAnswer:
         """Render citations first; the partial-answer disclosure is appended afterwards."""
 
         rendered = self._citations.render(
             terminal.answer,
-            evidence=terminal.evidence,
+            evidence=evidence,
             verified_chunk_ids=terminal.verified_chunk_ids,
-            allowed_document_ids={source.document_id for source in sources},
         )
         if terminal.status is not ResultStatus.VERIFIED_PARTIAL:
             return rendered
@@ -307,12 +342,28 @@ class SearchHandler:
             identity=state.identity,
             filters=request.filters,
         )
+        if retrieval.metadata_mismatch_count:
+            # Qdrant matched these hits, but MongoDB metadata did not; the stores have drifted.
+            self._emit(
+                state.request_id,
+                state.identity,
+                "rag.retrieval.metadata_mismatch",
+                attributes={
+                    "strategy": plan.kind.value,
+                    "count": retrieval.metadata_mismatch_count,
+                },
+            )
         context = await self._context_builder.build(
             query=state.query.canonical_question,
             candidates=retrieval.ranked_chunks,
             identity=state.identity,
+            filters=request.filters,
         )
-        return _Evidence(retrieval=retrieval, context=context)
+        refs = {
+            label: EvidenceRef.from_chunk(chunk)
+            for label, chunk in context.packed_context.evidence_by_label().items()
+        }
+        return _Evidence(retrieval=retrieval, context=context, refs=refs)
 
     async def _run_attempt(
         self,
@@ -342,7 +393,7 @@ class SearchHandler:
                 generation,
                 evaluation,
                 repaired=False,
-                labels=evidence.labels,
+                refs=evidence.refs,
             )
         self._keep_best(
             state, plan.kind, generation.draft.answer, evaluation, evidence, repaired=False
@@ -400,7 +451,7 @@ class SearchHandler:
                 repaired,
                 repaired_evaluation,
                 repaired=True,
-                labels=evidence.labels,
+                refs=evidence.refs,
             )
         return repaired_evaluation
 
@@ -547,7 +598,7 @@ class SearchHandler:
             evaluation=evaluation,
             strategy=strategy,
             repaired=repaired,
-            evidence=evidence.labels,
+            evidence_refs=evidence.refs,
         )
 
     def _partial_result(self, state: RagState | None, *, degraded: bool) -> TerminalResult | None:
@@ -560,16 +611,10 @@ class SearchHandler:
         partial = self._partial_result(state, degraded=False)
         if partial is not None:
             return partial
-        return TerminalResult(
-            status=ResultStatus.INSUFFICIENT_EVIDENCE,
-            answer=(
-                "I could not find sufficient information in the available documents "
-                "to answer this reliably."
-            ),
-            verified_chunk_ids=(),
-            unanswered_requirements=(state.query.canonical_question,),
-            strategy=state.attempted_strategies[-1] if state.attempted_strategies else None,
-            generation_repaired=bool(state.generation_repairs_used),
+        return _abstain(
+            state.query.literal_question,
+            state.attempted_strategies[-1] if state.attempted_strategies else None,
+            bool(state.generation_repairs_used),
         )
 
     async def _save_trace(self, record: _RequestRecord, started: float) -> None:
@@ -689,13 +734,41 @@ def _conversation_facts(state: RagState, plan: StrategyPlan) -> tuple[str, ...]:
     return () if plan.isolate_conversation else state.query.relevant_conversation_context
 
 
+def _withdrawal_reason(
+    ref: EvidenceRef, chunk: Chunk | None, filters: Mapping[str, str | int | float | bool]
+) -> str | None:
+    """Name why a packed passage can no longer support the answer, or None when it still can."""
+    if chunk is None:
+        # Deleted, superseded by a new version, or no longer readable by this caller.
+        return "unavailable"
+    if not chunk.matches_filters(filters):
+        return "metadata"
+    if EvidenceRef.from_chunk(chunk) != ref:
+        return "changed"
+    return None
+
+
+def _abstain(question: str, strategy: RetrievalStrategy | None, repaired: bool) -> TerminalResult:
+    return TerminalResult(
+        status=ResultStatus.INSUFFICIENT_EVIDENCE,
+        answer=(
+            "I could not find sufficient information in the available documents "
+            "to answer this reliably."
+        ),
+        verified_chunk_ids=(),
+        unanswered_requirements=(question,),
+        strategy=strategy,
+        generation_repaired=repaired,
+    )
+
+
 def _complete(
     strategy: RetrievalStrategy,
     generation: GenerationResult,
     evaluation: EvaluationResult,
     *,
     repaired: bool,
-    labels: dict[str, Chunk],
+    refs: dict[str, EvidenceRef],
 ) -> TerminalResult:
     return TerminalResult(
         status=ResultStatus.COMPLETE,
@@ -704,7 +777,7 @@ def _complete(
         unanswered_requirements=(),
         strategy=strategy,
         generation_repaired=repaired,
-        evidence=labels,
+        evidence_refs=refs,
     )
 
 
@@ -716,6 +789,6 @@ def _partial(best: VerifiedAnswer, *, degraded: bool) -> TerminalResult:
         unanswered_requirements=best.unanswered_requirements,
         strategy=best.strategy,
         generation_repaired=best.generation_repaired,
-        evidence=best.evidence,
+        evidence_refs=best.evidence_refs,
         degraded=degraded,
     )

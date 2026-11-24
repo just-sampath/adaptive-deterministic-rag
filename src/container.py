@@ -31,13 +31,15 @@ from providers.mongodb import build_mongo_client
 from providers.openai import OpenAIEmbeddingProvider, OpenAITextModel, build_openai_client
 from providers.qdrant import build_qdrant_client
 from providers.sparse import Bm25SparseEncoder
+from providers.tokenizer import load_o200k_counter
 from services.citations import CitationRenderer
-from services.context import ContextBuilder, ContextPacker, StructuralCompleter
+from services.context import ContextBuilder, ContextPacker, StructuralCompleter, utf8_byte_count
 from services.contracts import (
     AsyncCloseable,
     ConversationStore,
     DocumentReader,
     FollowupDetector,
+    PassageTokenCounter,
     QueryEncoder,
     Reranker,
     TextModel,
@@ -54,7 +56,7 @@ from services.retrieval import HybridRetriever, QueryRecoveryService, StrategyRe
 from services.telemetry import TelemetryService
 from services.understanding import QueryUnderstandingService
 from utils.errors import ConfigurationError
-from utils.settings import FollowupDetectorName, Settings, SparseEncoderName
+from utils.settings import FollowupDetectorName, Settings, SparseEncoderName, TokenizerEncoding
 
 logger = logging.getLogger(__name__)
 _RESOURCE_CLOSE_TIMEOUT_SECONDS = 5.0
@@ -95,9 +97,12 @@ async def create_container(settings: Settings) -> AppContainer:
     """Resolve provider implementations from validated startup settings."""
 
     _validate_implementations(settings)
+    count_tokens: PassageTokenCounter = utf8_byte_count
+    if settings.context.tokenizer_encoding is TokenizerEncoding.O200K_BASE:
+        count_tokens = await asyncio.to_thread(load_o200k_counter)
     resources: list[AsyncCloseable] = []
     try:
-        return _compose(settings, resources)
+        return _compose(settings, resources, count_tokens)
     except BaseException:
         await _close_all(resources)
         raise
@@ -123,7 +128,9 @@ def _require_supported(label: str, configured: str, supported: Iterable[str]) ->
         raise ConfigurationError(f"Unsupported {label}: {configured}")
 
 
-def _compose(settings: Settings, resources: list[AsyncCloseable]) -> AppContainer:
+def _compose(
+    settings: Settings, resources: list[AsyncCloseable], count_tokens: PassageTokenCounter
+) -> AppContainer:
     """Wire the process graph in dependency order; every client is tracked when created."""
 
     clients = _build_clients(settings, resources)
@@ -168,6 +175,7 @@ def _compose(settings: Settings, resources: list[AsyncCloseable]) -> AppContaine
         settings=settings,
         query_handler=_build_query_handler(
             settings,
+            count_tokens=count_tokens,
             text_model=text_model,
             detector=detector,
             encoder=encoder,
@@ -289,6 +297,7 @@ def _build_detector(settings: Settings, text_model: TextModel) -> FollowupDetect
 def _build_query_handler(
     settings: Settings,
     *,
+    count_tokens: PassageTokenCounter,
     text_model: TextModel,
     detector: FollowupDetector,
     encoder: QueryEncoder,
@@ -323,7 +332,7 @@ def _build_query_handler(
                 max_neighbors_per_seed=settings.context.max_neighbors_per_seed,
                 short_chunk_tokens=settings.context.short_chunk_tokens,
             ),
-            packer=ContextPacker(settings.context),
+            packer=ContextPacker(settings.context, count_tokens),
             generation_k=settings.retrieval.generation_k,
             reranking_timeout_seconds=settings.timeouts.reranking_seconds,
         ),

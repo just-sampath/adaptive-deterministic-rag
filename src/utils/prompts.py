@@ -103,10 +103,7 @@ def evidence_payload(context: PackedContext) -> list[dict[str, object]]:
     return [
         {
             "evidence_label": evidence_label(position),
-            "document": item.chunk.document_title,
-            "document_version": item.chunk.document_version,
-            "section": list(item.chunk.heading_path),
-            "content": item.chunk.text,
+            **item.chunk.passage_fields(),
         }
         for position, item in enumerate(context.chunks, start=1)
     ]

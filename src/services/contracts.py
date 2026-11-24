@@ -18,7 +18,6 @@ from models.domain import (
     ModelResult,
     RankedChunk,
     RequestTrace,
-    Source,
     SparseEmbedding,
     TelemetryEvent,
 )
@@ -109,6 +108,12 @@ class Reranker(Protocol):
     ) -> list[RankedChunk]: ...
 
 
+class PassageTokenCounter(Protocol):
+    """Measure the content of one passage in the configured packing units."""
+
+    def __call__(self, text: str, /) -> int: ...
+
+
 class DocumentReader(Protocol):
     async def hydrate_authorized_chunks(
         self,
@@ -121,12 +126,6 @@ class DocumentReader(Protocol):
         chunk_ids: Sequence[str],
         identity: Identity,
     ) -> dict[str, Chunk]: ...
-
-    async def get_sources(
-        self,
-        chunk_ids: Sequence[str],
-        identity: Identity,
-    ) -> tuple[Source, ...]: ...
 
 
 class ConversationStore(Protocol):

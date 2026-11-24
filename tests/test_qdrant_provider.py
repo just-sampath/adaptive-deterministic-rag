@@ -14,6 +14,7 @@ from db.vector_index import VectorIndexSpec, build_vector_index_spec
 from managers.vector import QdrantVectorManager, to_qdrant_sparse
 from models.domain import EncodedQuery, HybridHits, Identity, SparseEmbedding
 from providers.sparse import Bm25SparseEncoder
+from tests.fakes import make_chunk
 from utils.errors import (
     InfrastructureError,
     InvalidRequestError,
@@ -262,9 +263,10 @@ async def test_ensure_ready_cancels_qdrant_setup_when_mongo_setup_fails(
     await client.close()
 
 
-def test_manager_rejects_invalid_metadata_key() -> None:
+@pytest.mark.parametrize("key", ["$unsafe", "flat.key"])
+def test_manager_rejects_invalid_metadata_key(key: str) -> None:
     with pytest.raises(InvalidRequestError, match="Invalid metadata"):
-        QdrantVectorManager._filter(_identity(), {"$unsafe": "value"})
+        QdrantVectorManager._filter(_identity(), {key: "value"})
 
 
 async def test_initializer_creates_physical_collection_alias_and_idf_indexes() -> None:
@@ -489,3 +491,38 @@ def _alias(collection: str, alias: str) -> models.CreateAliasOperation:
     return models.CreateAliasOperation(
         create_alias=models.CreateAlias(collection_name=collection, alias_name=alias)
     )
+
+
+async def test_flat_mongo_metadata_matches_local_vector_filters() -> None:
+    records = [
+        make_chunk(_FIRST).model_copy(update={"metadata": {"lang": "en", "v": 1, "flat.key": "x"}}),
+        make_chunk(_SECOND).model_copy(update={"metadata": {"lang": "fr", "v": True}}),
+        make_chunk(_THIRD).model_copy(update={"metadata": {"lang": "en", "v": 1.0}}),
+    ]
+    client = AsyncQdrantClient(location=":memory:")
+    spec = _spec()
+    try:
+        await _initializer(client, spec)._ensure_qdrant()
+        points = []
+        for record in records:
+            point = _point(record.id, roles=["reader"])
+            assert point.payload is not None
+            point.payload["metadata"] = record.metadata
+            points.append(point)
+        await client.upsert(spec.physical_collection, points=points, wait=True)
+        manager = _manager(client, spec)
+        cases: list[tuple[dict[str, str | int | float | bool], set[str]]] = [
+            ({"lang": "en"}, {_FIRST, _THIRD}),
+            ({"v": True}, {_SECOND}),
+            ({"v": 1}, {_FIRST}),
+            ({"v": 1.0}, {_FIRST, _THIRD}),
+            ({"missing": "x"}, set()),
+            ({"v": 1.0, "lang": "fr"}, set()),
+        ]
+        for filters, expected in cases:
+            hits = await manager.search(_query(), _identity(), filters, dense_k=3, sparse_k=3)
+            assert {hit.chunk_id for hit in hits.dense} == expected
+            assert {record.id for record in records if record.matches_filters(filters)} == expected
+        assert not records[0].matches_filters({"flat.key": "x"})
+    finally:
+        await client.close()

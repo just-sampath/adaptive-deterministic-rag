@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from pymongo.asynchronous.database import AsyncDatabase
 
 from managers.errors import mongo_errors
-from models.domain import Chunk, Identity, Source
+from models.domain import Chunk, Identity
 from utils.errors import ProviderResponseError
 
 _CHUNK_PROJECTION: dict[str, int] = {"_id": 0, **dict.fromkeys(Chunk.model_fields, 1)}
@@ -49,8 +49,9 @@ class MongoDocumentManager:
             return {}
         try:
             parsed_chunks = [Chunk.model_validate(item) for item in raw_chunks]
-        except ValidationError as exc:
-            raise ProviderResponseError("MongoDB returned an invalid chunk record") from exc
+        except ValidationError:
+            # Validation errors can include the rejected record in a formatted traceback.
+            raise ProviderResponseError("MongoDB returned an invalid chunk record") from None
         document_ids = list({chunk.document_id for chunk in parsed_chunks})
         raw_documents = [
             item
@@ -81,32 +82,6 @@ class MongoDocumentManager:
         identity: Identity,
     ) -> dict[str, Chunk]:
         return await self.hydrate_authorized_chunks(chunk_ids, identity)
-
-    @mongo_errors
-    async def get_sources(
-        self,
-        chunk_ids: Sequence[str],
-        identity: Identity,
-    ) -> tuple[Source, ...]:
-        chunks = await self.hydrate_authorized_chunks(chunk_ids, identity)
-        by_document: dict[str, list[Chunk]] = {}
-        for chunk_id in chunk_ids:
-            chunk = chunks.get(chunk_id)
-            if chunk:
-                by_document.setdefault(chunk.document_id, []).append(chunk)
-        return tuple(
-            Source(
-                document_id=document_id,
-                title=items[0].document_title,
-                sections=tuple(
-                    dict.fromkeys(
-                        " > ".join(chunk.heading_path) for chunk in items if chunk.heading_path
-                    )
-                ),
-                version=items[0].document_version,
-            )
-            for document_id, items in by_document.items()
-        )
 
 
 def _is_current_and_authorized(

@@ -13,6 +13,7 @@ from models.domain import (
     Chunk,
     CompletenessEvaluation,
     CompletenessStatus,
+    EvidenceRef,
     FaithfulnessEvaluation,
     FaithfulnessStatus,
     Identity,
@@ -135,7 +136,7 @@ def preserve(state: RagState, result: EvaluationResult, answer: str) -> None:
         evaluation=result,
         strategy=HAPPY,
         repaired=False,
-        evidence={},
+        evidence_refs={},
     )
 
 
@@ -544,7 +545,7 @@ def test_partial_answer_keeps_verified_sources_and_evidence() -> None:
         ),
         strategy=RECALL,
         repaired=True,
-        evidence={"E1": chunk},
+        evidence_refs={"E1": EvidenceRef.from_chunk(chunk)},
     )
 
     best = state.best_verified_answer
@@ -554,7 +555,7 @@ def test_partial_answer_keeps_verified_sources_and_evidence() -> None:
     assert best.unanswered_requirements == ("limitations",)
     assert best.strategy is RECALL
     assert best.generation_repaired is True
-    assert best.evidence == {"E1": chunk}
+    assert best.evidence_refs == {"E1": EvidenceRef.from_chunk(chunk)}
 
 
 @pytest.mark.parametrize(

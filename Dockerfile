@@ -20,8 +20,10 @@ RUN uv sync --frozen --no-dev
 COPY config ./config
 COPY scripts ./scripts
 COPY src ./src
+RUN .venv/bin/python -m scripts.prefetch_tokenizer && chmod a+r .tokenizer/o200k_base.tiktoken
 
 USER app
+RUN --network=none .venv/bin/python -c "from providers.tokenizer import load_o200k_counter; assert load_o200k_counter()('hello') == 1"
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
     CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2)"]

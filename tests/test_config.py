@@ -103,6 +103,55 @@ def test_settings_reject_unknown_stable_configuration_key(
         make_settings(retrieval={"candidate_typo": 50})
 
 
+def test_unverified_deployment_defaults_to_byte_counting(
+    make_settings: Callable[..., Settings],
+) -> None:
+    context = make_settings().context
+
+    assert context.tokenizer_encoding == "utf8_bytes"
+    assert context.tokenizer_verified_for is None
+
+
+def test_tokenizer_accepts_explicit_verification_for_exact_generation_model(
+    make_settings: Callable[..., Settings],
+) -> None:
+    settings = make_settings(
+        ai={"provider": "fake", "generation_model": "deployment-v2"},
+        context={"tokenizer_encoding": "o200k_base", "tokenizer_verified_for": "deployment-v2"},
+    )
+
+    assert settings.context.tokenizer_encoding == "o200k_base"
+    assert settings.context.tokenizer_verified_for == "deployment-v2"
+
+
+@pytest.mark.parametrize(
+    ("generation_model", "verified_for"),
+    [("deployment-v2", None), ("   ", "   "), ("deployment-v2", "deployment"), ("v2", "v2 ")],
+)
+def test_tokenizer_requires_nonblank_verification_matching_the_generation_model(
+    make_settings: Callable[..., Settings], generation_model: str, verified_for: str | None
+) -> None:
+    with pytest.raises(ValidationError, match=r"must exactly match ai\.generation_model"):
+        make_settings(
+            ai={"provider": "fake", "generation_model": generation_model},
+            context={"tokenizer_encoding": "o200k_base", "tokenizer_verified_for": verified_for},
+        )
+
+
+def test_byte_counting_rejects_leftover_tokenizer_verification(
+    make_settings: Callable[..., Settings],
+) -> None:
+    with pytest.raises(ValidationError, match="tokenizer_verified_for must be null"):
+        make_settings(context={"tokenizer_verified_for": "deployment-v2"})
+
+
+def test_settings_reject_unknown_tokenizer_encoding(make_settings: Callable[..., Settings]) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        make_settings(context={"tokenizer_encoding": "unknown"})
+
+    assert exc_info.value.errors()[0]["type"] == "enum"
+
+
 def test_settings_reject_collection_name_collisions(
     make_settings: Callable[..., Settings],
 ) -> None:

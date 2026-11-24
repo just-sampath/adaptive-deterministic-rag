@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
+from typing import Any
 
 import pytest
 
@@ -10,6 +11,7 @@ from handlers.policy import DecisionPolicy
 from handlers.search import SearchHandler
 from handlers.search_strategies.registry import build_strategy_registry
 from models.domain import (
+    Chunk,
     Citation,
     CompletenessEvaluation,
     CompletenessStatus,
@@ -25,6 +27,7 @@ from models.domain import (
     QueryRecoveryOutput,
     QueryRequest,
     RagFailure,
+    RankedChunk,
     RequestTrace,
     RequirementEvaluation,
     RequirementStatus,
@@ -33,11 +36,10 @@ from models.domain import (
     RetryDecision,
     RetryHypothesis,
     SearchHit,
-    Source,
 )
 from providers.sparse import Bm25SparseEncoder
 from services.citations import CitationRenderer
-from services.context import ContextBuilder, ContextPacker, StructuralCompleter
+from services.context import ContextBuilder, ContextPacker, StructuralCompleter, utf8_byte_count
 from services.encoding import EmbeddingCache, HybridQueryEncoder
 from services.evaluation import GenerationService, OnlineEvaluator
 from services.retrieval import HybridRetriever, QueryRecoveryService, StrategyRetriever
@@ -126,6 +128,33 @@ def scripted_store(
     return store
 
 
+def _telemetry(repository: FakeRepository) -> TelemetryService:
+    return TelemetryService(
+        repository,
+        TelemetryConfig(enabled=True, content_mode=ContentMode.METADATA_ONLY),
+        hash_key=b"test-telemetry-key",
+    )
+
+
+class _RecordingTelemetry(TelemetryService):
+    """Keep emitted events in memory; the queue worker is not started in these tests."""
+
+    def __init__(self, repository: FakeRepository) -> None:
+        super().__init__(
+            repository,
+            TelemetryConfig(enabled=True, content_mode=ContentMode.METADATA_ONLY),
+            hash_key=b"test-telemetry-key",
+        )
+        self.emitted: list[tuple[str, dict[str, object]]] = []
+
+    def emit(self, event_type: str, **kwargs: Any) -> None:
+        self.emitted.append((event_type, dict(kwargs.get("attributes") or {})))
+        super().emit(event_type, **kwargs)
+
+    def named(self, event_type: str) -> list[dict[str, object]]:
+        return [attributes for name, attributes in self.emitted if name == event_type]
+
+
 def build_orchestrator(
     *,
     model: FakeTextModel,
@@ -134,6 +163,9 @@ def build_orchestrator(
     timeouts: TimeoutConfig | None = None,
     detector: FakeFollowupDetector | None = None,
     inline_citations: bool = True,
+    reranker: FakeReranker | None = None,
+    max_neighbors: int = 0,
+    telemetry: TelemetryService | None = None,
 ) -> SearchHandler:
     retrieval = RetrievalConfig(
         happy_dense_k=4,
@@ -148,7 +180,7 @@ def build_orchestrator(
         max_tokens=512,
         max_seed_chunks=2,
         max_document_share=1,
-        max_neighbors_per_seed=0,
+        max_neighbors_per_seed=max_neighbors,
     )
     contextualization = ContextualizationConfig()
     policy = PolicyConfig()
@@ -188,13 +220,13 @@ def build_orchestrator(
             config=retrieval,
         ),
         context_builder=ContextBuilder(
-            reranker=FakeReranker(),
+            reranker=reranker if reranker is not None else FakeReranker(),
             completer=StructuralCompleter(
                 repository=repository,
-                max_neighbors_per_seed=0,
+                max_neighbors_per_seed=max_neighbors,
                 short_chunk_tokens=context.short_chunk_tokens,
             ),
-            packer=ContextPacker(context),
+            packer=ContextPacker(context, utf8_byte_count),
             generation_k=2,
             reranking_timeout_seconds=STAGE_SECONDS,
         ),
@@ -214,11 +246,7 @@ def build_orchestrator(
         strategies=build_strategy_registry(retrieval),
         documents=repository,
         conversations=repository,
-        telemetry=TelemetryService(
-            repository,
-            TelemetryConfig(enabled=True, content_mode=ContentMode.METADATA_ONLY),
-            hash_key=b"test-telemetry-key",
-        ),
+        telemetry=telemetry if telemetry is not None else _telemetry(repository),
         citations=CitationRenderer(inline=inline_citations),
         policy=policy,
         retrieval=retrieval,
@@ -317,13 +345,12 @@ def _generation_payloads(model: FakeTextModel) -> list[dict[str, object]]:
 class _SourcesUnavailableRepository(FakeRepository):
     """Authorized retrieval works, but the final source lookup fails."""
 
-    async def get_sources(
-        self,
-        chunk_ids: Sequence[str],
-        identity: Identity,
-    ) -> tuple[Source, ...]:
-        del chunk_ids, identity
-        raise ProviderError("document store unavailable")
+    async def hydrate_authorized_chunks(
+        self, chunk_ids: Sequence[str], identity: Identity
+    ) -> dict[str, Chunk]:
+        if self.hydrate_calls:
+            raise ProviderError("document store unavailable")
+        return await super().hydrate_authorized_chunks(chunk_ids, identity)
 
 
 async def test_orchestrator_repairs_once_and_re_evaluates_entire_answer(
@@ -449,20 +476,55 @@ async def test_orchestrator_exhausts_each_retrieval_strategy_once_then_abstains(
     assert [decision.next_strategy for decision in decisions] == [RECALL, RECOVERY, None]
 
 
+class _HandbookReranker(FakeReranker):
+    async def rerank(
+        self, query: str, chunks: Sequence[RankedChunk], top_n: int
+    ) -> list[RankedChunk]:
+        assert [r.chunk.id for r in chunks] == [CHUNK_ID]
+        return await super().rerank(query, chunks, top_n)
+
+
+def _bilingual_handbook() -> tuple[FakeRepository, FakeVectorSearch]:
+    seed = make_chunk(CHUNK_ID, text="English summary:", next_id="following").model_copy(
+        update={"metadata": {"lang": "en"}}
+    )
+    other = make_chunk("other", text="French summary").model_copy(
+        update={"metadata": {"lang": "fr"}}
+    )
+    following = other.model_copy(update={"id": "following", "text": "French continuation"})
+    store = hit_store()
+    store.dense_hits.append(SearchHit(chunk_id=other.id, score=0.5, rank=2))
+    return FakeRepository((seed, other, following)), store
+
+
+def _assert_english_evidence(model: FakeTextModel) -> None:
+    for kind, prompt in model.output_prompts:
+        if kind in (GenerationDraft, FaithfulnessEvaluation, CompletenessEvaluation):
+            assert [item["content"] for item in json.loads(prompt)["evidence"]] == [
+                "English summary:"
+            ]
+
+
 async def test_partial_answer_after_exhausting_strategies_discloses_unanswered_requirements(
     identity: Identity,
 ) -> None:
-    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    repository, vector_store = _bilingual_handbook()
     model = FakeTextModel()
     model.queue(QueryRecoveryOutput, QueryRecoveryOutput())
     queue_partial_rounds(model, rounds=3)
+    telemetry = _RecordingTelemetry(repository)
     orchestrator = build_orchestrator(
         model=model,
         repository=repository,
-        vector_store=hit_store(),
+        vector_store=vector_store,
+        reranker=_HandbookReranker(),
+        max_neighbors=1,
+        telemetry=telemetry,
     )
 
-    response = await orchestrator.query(identity, QueryRequest(message="Explain the feature"))
+    response = await orchestrator.query(
+        identity, QueryRequest(filters={"lang": "en"}, message="Explain the feature")
+    )
 
     assert response.status is ResultStatus.VERIFIED_PARTIAL
     assert response.answer == (
@@ -470,6 +532,15 @@ async def test_partial_answer_after_exhausting_strategies_discloses_unanswered_r
     )
     assert response.unanswered_requirements == ("limitations",)
     assert response.metadata.degraded is False
+    _assert_english_evidence(model)
+    # The fake vector store ignores filters, so the French hit stands in for store drift.
+    mismatches = telemetry.named("rag.retrieval.metadata_mismatch")
+    assert [event["strategy"] for event in mismatches] == [
+        HAPPY.value,
+        RECOVERY.value,
+        RECALL.value,
+    ]
+    assert all(event["count"] == 1 for event in mismatches)
     trace = repository.traces[response.request_id]
     assert trace.attempted_strategies == (HAPPY, RECOVERY, RECALL)
     assert trace.final_status is ResultStatus.VERIFIED_PARTIAL
@@ -689,7 +760,7 @@ async def test_later_turns_never_see_citation_markers_from_earlier_answers(
 async def test_contaminated_generation_is_retried_in_isolation_without_repeating_retrieval(
     identity: Identity,
 ) -> None:
-    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    repository, vector_store = _bilingual_handbook()
     repository.messages["conversation-1"].extend(
         [
             ConversationMessage(role="user", content="Tell me about migration"),
@@ -718,20 +789,24 @@ async def test_contaminated_generation_is_retried_in_isolation_without_repeating
         _complete_evaluation(),
         _complete_evaluation(),
     )
-    vector_store = hit_store()
     orchestrator = build_orchestrator(
         model=model,
         repository=repository,
         vector_store=vector_store,
+        reranker=_HandbookReranker(),
+        max_neighbors=1,
         detector=FakeFollowupDetector(probability=1),
     )
 
     response = await orchestrator.query(
         identity,
-        QueryRequest(message="Explain the feature", conversation_id="conversation-1"),
+        QueryRequest(
+            filters={"lang": "en"}, message="Explain the feature", conversation_id="conversation-1"
+        ),
     )
 
     assert response.status is ResultStatus.COMPLETE
+    _assert_english_evidence(model)
     trace = repository.traces[response.request_id]
     assert trace.attempted_strategies == (HAPPY, CONTEXT_ISOLATION)
     assert [attempt.generation_repair_attempted for attempt in trace.attempts] == [
@@ -937,3 +1012,150 @@ async def test_recorded_candidates_keep_per_list_ranks_with_none_for_single_list
     assert (candidates[both].dense_rank, candidates[both].sparse_rank) == (2, 1)
     assert (candidates[dense_only].dense_rank, candidates[dense_only].sparse_rank) == (1, None)
     assert (candidates[sparse_only].dense_rank, candidates[sparse_only].sparse_rank) == (None, 2)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing",
+        "repaired",
+        "text",
+        "heading",
+        "version",
+        "metadata",
+        "still_eligible",
+        "unchanged",
+    ],
+)
+async def test_final_evidence_uses_every_packed_passage(identity: Identity, change: str) -> None:
+    first = make_chunk(CHUNK_ID).model_copy(update={"metadata": {"lang": "en"}})
+    sibling = first.model_copy(update={"id": "sibling", "heading_path": ("Details",)})
+
+    class UpdatedCatalog(FakeRepository):
+        async def hydrate_authorized_chunks(
+            self, chunk_ids: Sequence[str], identity: Identity
+        ) -> dict[str, Chunk]:
+            if self.hydrate_calls:
+                updates: dict[str, dict[str, object]] = {
+                    "text": {"text": "Revised edition."},
+                    "heading": {"heading_path": ("Appendix",)},
+                    "version": {"document_version_id": "v2"},
+                    "metadata": {"metadata": {"lang": "fr"}},
+                    "still_eligible": {
+                        "metadata": {"lang": "en", "edition": 2},
+                        "allowed_roles": identity.roles | {"editor"},
+                    },
+                }
+                if change in {"missing", "repaired"}:
+                    self.chunks.pop(sibling.id, None)
+                elif change in updates:
+                    self.chunks[sibling.id] = sibling.model_copy(update=updates[change])
+            return await super().hydrate_authorized_chunks(chunk_ids, identity)
+
+    repository = UpdatedCatalog((first, sibling))
+    repository.messages["guide"].append(ConversationMessage(role="user", content="Handbooks"))
+    store = hit_store()
+    store.dense_hits.append(SearchHit(chunk_id=sibling.id, score=0.5, rank=2))
+    model = FakeTextModel()
+    cited: tuple[str, ...] = (first.id,)
+    if change == "repaired":
+        model.queue(GenerationDraft, GenerationDraft(answer="First draft."))
+        model.queue(FaithfulnessEvaluation, _unsupported(correcting=True))
+        model.queue(CompletenessEvaluation, _complete_evaluation())
+    if change == "missing":
+        model.queue(GenerationDraft, GenerationDraft(answer="The handbook applies [E1, E2]."))
+        model.queue(
+            FaithfulnessEvaluation,
+            _supported().model_copy(update={"verified_sources": ("E1", "E2")}),
+        )
+        model.queue(CompletenessEvaluation, _complete_evaluation())
+        cited = (first.id, sibling.id)
+    else:
+        queue_complete_answer(model, "The handbook applies [E1].")
+    model.queue(
+        ContextualizationOutput,
+        ContextualizationOutput(standalone_question="Which handbook applies to the new edition?"),
+    )
+    telemetry = _RecordingTelemetry(repository)
+    handler = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=store,
+        detector=FakeFollowupDetector(probability=1),
+        telemetry=telemetry,
+    )
+    request = QueryRequest(
+        message="Which handbook applies?", conversation_id="guide", filters={"lang": "en"}
+    )
+    response = await handler.query(identity, request)
+    trace = repository.traces[response.request_id]
+    assert trace.final_status is ResultStatus.COMPLETE
+    assert _generation_payloads(model)[0]["question"] != request.message
+    assert trace.final_source_ids == cited
+    assert response.metadata.generation_repaired is (change == "repaired")
+    assert len(_generation_payloads(model)) == (2 if change == "repaired" else 1)
+    assert repository.hydrate_calls == [(first.id, sibling.id), (first.id, sibling.id)]
+    if change in {"unchanged", "still_eligible"}:
+        assert response.status is ResultStatus.COMPLETE
+        assert response.citations == (CITATION,)
+        assert [s.document_id for s in response.sources] == [first.document_id]
+        assert telemetry.named("rag.evidence.withdrawn") == []
+    else:
+        # A superseded version is no longer current, so hydration omits it like a deletion.
+        unavailable = ("missing", "repaired", "version")
+        reason = dict.fromkeys(unavailable, "unavailable") | {"metadata": "metadata"}
+        assert telemetry.named("rag.evidence.withdrawn") == [
+            {
+                "reason": reason.get(change, "changed"),
+                "selected_status": "COMPLETE",
+                "strategy": HAPPY.value,
+                "packed_passages": 2,
+            }
+        ]
+        assert response.status is ResultStatus.INSUFFICIENT_EVIDENCE
+        assert response.unanswered_requirements == (request.message,)
+        assert response.sources == ()
+        assert response.citations == ()
+        assert repository.messages["guide"][-1].content == response.answer
+        assert "handbook applies" not in response.answer
+
+
+@pytest.mark.parametrize("degraded", [False, True])
+async def test_selected_partial_rechecks_its_own_evidence(
+    identity: Identity, degraded: bool
+) -> None:
+    first = make_chunk(CHUNK_ID)
+    later = make_chunk("later-edition")
+    repository = FakeRepository((first, later))
+
+    async def switch_edition() -> None:
+        repository.chunks.pop(first.id, None)
+        if degraded:
+            raise TimeoutError
+        store.dense_hits = [SearchHit(chunk_id=later.id, score=1, rank=1)]
+        store.sparse_hits = []
+
+    store = scripted_store(fail_from=2, action=switch_edition)
+    model = FakeTextModel()
+    model.queue(QueryRecoveryOutput, QueryRecoveryOutput())
+    queue_partial_rounds(model, rounds=1 if degraded else 3)
+    telemetry = _RecordingTelemetry(repository)
+    handler = build_orchestrator(
+        model=model, repository=repository, vector_store=store, telemetry=telemetry
+    )
+    response = await handler.query(
+        identity, QueryRequest(message="Explain the feature", conversation_id="guide")
+    )
+    (withdrawn,) = telemetry.named("rag.evidence.withdrawn")
+    assert withdrawn["reason"] == "unavailable"
+    assert withdrawn["selected_status"] == "VERIFIED_PARTIAL"
+
+    trace = repository.traces[response.request_id]
+    assert trace.final_status is ResultStatus.VERIFIED_PARTIAL
+    assert trace.degraded is degraded
+    assert trace.final_source_ids == (first.id,)
+    assert repository.hydrate_calls[-1] == (first.id,)
+    assert response.status is ResultStatus.INSUFFICIENT_EVIDENCE
+    assert response.sources == ()
+    assert response.citations == ()
+    assert repository.messages["guide"][-1].content == response.answer

@@ -37,6 +37,7 @@ rules. This file holds the rules and conventions that aren't obvious from the co
 ```bash
 uv python install 3.13.9
 uv sync --frozen --all-groups
+uv run --frozen python -m scripts.prefetch_tokenizer
 cp .env.example .env
 docker compose up -d mongo qdrant        # MongoDB :27017, Qdrant :6333
 uv run --frozen uvicorn server:app --app-dir src --host 0.0.0.0 --port 8000   # http://localhost:8000/docs
@@ -66,7 +67,10 @@ There is no separate build step. `docker compose up --build` builds and runs the
 
 - Every Qdrant query carries tenant, role and `active` filters, added inside the vector manager.
   MongoDB then rechecks tenant, ACL, deletion state and the current document version before content
-  reaches a prompt. Never bypass or weaken either check.
+  reaches a prompt. Never bypass or weaken either check. Recheck request metadata on hydrated
+  seeds and neighbors. Before presenting or storing an answer, revalidate every packed passage
+  from the winning attempt, including its model-visible content. Derive public sources and
+  citations from that final read.
 - `scripts/seed_dummy_data.py` is the only vector writer, and it refuses to run unless
   `APP_ENV=local`. No file under `src/` writes Qdrant points or imports `scripts`
   (`tests/test_seed_boundary.py` enforces both). Don't add an ingestion or write route.

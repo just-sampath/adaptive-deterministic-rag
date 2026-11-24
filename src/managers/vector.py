@@ -8,10 +8,17 @@ from typing import Any
 from qdrant_client import AsyncQdrantClient, models
 
 from managers.errors import qdrant_errors
-from models.domain import EncodedQuery, HybridHits, Identity, SearchHit, SparseEmbedding
+from models.domain import (
+    FILTER_KEY_PATTERN,
+    EncodedQuery,
+    HybridHits,
+    Identity,
+    SearchHit,
+    SparseEmbedding,
+)
 from utils.errors import InvalidRequestError
 
-_METADATA_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
+_METADATA_KEY = re.compile(FILTER_KEY_PATTERN)
 
 
 class QdrantVectorManager:

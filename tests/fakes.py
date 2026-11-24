@@ -22,7 +22,6 @@ from models.domain import (
     RankedChunk,
     RequestTrace,
     SearchHit,
-    Source,
     SparseEmbedding,
     TelemetryEvent,
 )
@@ -222,27 +221,6 @@ class FakeRepository:
         identity: Identity,
     ) -> dict[str, Chunk]:
         return await self.hydrate_authorized_chunks(chunk_ids, identity)
-
-    async def get_sources(
-        self,
-        chunk_ids: Sequence[str],
-        identity: Identity,
-    ) -> tuple[Source, ...]:
-        chunks = await self.hydrate_authorized_chunks(chunk_ids, identity)
-        by_document: dict[str, Chunk] = {}
-        for chunk_id in chunk_ids:
-            chunk = chunks.get(chunk_id)
-            if chunk:
-                by_document.setdefault(chunk.document_id, chunk)
-        return tuple(
-            Source(
-                document_id=chunk.document_id,
-                title=chunk.document_title,
-                sections=(" > ".join(chunk.heading_path),) if chunk.heading_path else (),
-                version=chunk.document_version,
-            )
-            for chunk in by_document.values()
-        )
 
     async def get_messages(
         self,

@@ -133,9 +133,40 @@ async def test_construction_failure_closes_clients_already_built(
     assert closed == ["openai"]
 
 
+async def test_selected_vocabulary_must_load_before_clients_are_created(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = Settings.model_validate(
+        {
+            **settings.model_dump(),
+            "context": {
+                **settings.context.model_dump(),
+                "tokenizer_encoding": "o200k_base",
+                "tokenizer_verified_for": settings.ai.generation_model,
+            },
+        }
+    )
+
+    def missing_vocabulary() -> None:
+        raise ConfigurationError("Vocabulary unavailable")
+
+    def unexpected_client(*_: object, **__: object) -> None:
+        pytest.fail("A client was created before the selected vocabulary was verified")
+
+    monkeypatch.setattr(container, "load_o200k_counter", missing_vocabulary)
+    monkeypatch.setattr(container, "_build_clients", unexpected_client)
+    with pytest.raises(ConfigurationError, match="Vocabulary unavailable"):
+        await create_container(configured)
+
+
 async def test_built_container_wires_handlers_and_closes_its_resources(
     settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    def unexpected_vocabulary() -> None:
+        pytest.fail("Byte-mode startup tried to load a vocabulary")
+
+    monkeypatch.setattr(container, "load_o200k_counter", unexpected_vocabulary)
     built = await create_container(settings)
     try:
         assert len(built.external_resources) == 4

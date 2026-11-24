@@ -475,3 +475,22 @@ async def test_fused_candidates_are_hydrated_in_one_repository_call(identity: Id
     assert len(outcome.ranked_chunks) == 4
     assert len(repository.hydrate_calls) == 1
     assert sorted(repository.hydrate_calls[0]) == sorted(chunk.id for chunk in chunks)
+
+
+async def test_filter_hydrated_seeds_before_candidate_limit(identity: Identity) -> None:
+    chunks = [
+        make_chunk(key).model_copy(update={"metadata": {"lang": lang}})
+        for key, lang in [("first", "fr"), ("second", "en")]
+    ]
+    store = FakeVectorSearch()
+    store.dense_hits = [
+        SearchHit(chunk_id=c.id, score=1 / rank, rank=rank) for rank, c in enumerate(chunks, 1)
+    ]
+    outcome = await _retriever(store, FakeRepository(chunks)).retrieve(
+        query="handbook",
+        identity=identity,
+        filters={"lang": "en"},
+        plan=RetrievalPlan(dense_k=2, sparse_k=0, candidate_k=1),
+    )
+    assert [r.chunk.id for r in outcome.ranked_chunks] == ["second"]
+    assert outcome.metadata_mismatch_count == 1

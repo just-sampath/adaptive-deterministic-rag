@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from models.domain import Chunk, Citation
-from services.citations import CitationRenderer
+from services.citations import CitationRenderer, sources_from_chunks
 from tests.fakes import make_chunk
 
 
@@ -31,7 +31,6 @@ def test_citations_are_numbered_by_first_appearance_and_sorted_within_a_marker()
         "Second fact [E2]. First fact [E1, E2].",
         evidence=evidence,
         verified_chunk_ids={"chunk-1", "chunk-2"},
-        allowed_document_ids={"doc-a"},
     )
 
     assert rendered.text == "Second fact [1]. First fact [1, 2]."
@@ -45,14 +44,13 @@ def test_unknown_unverified_and_disallowed_labels_are_removed_with_their_leading
     evidence = {
         "E1": _chunk("chunk-1"),
         "E2": _chunk("chunk-2"),
-        "E3": _chunk("chunk-3", document_id="doc-b"),
+        # E3 was verified earlier but is absent from the authorized chunk mapping.
     }
 
     rendered = CitationRenderer(inline=True).render(
         "Kept [E1]. Unknown [E9] here. Unverified [E2]. Blocked [E3] .",
         evidence=evidence,
         verified_chunk_ids={"chunk-1", "chunk-3"},
-        allowed_document_ids={"doc-a"},
     )
 
     assert rendered.text == "Kept [1]. Unknown here. Unverified. Blocked."
@@ -66,7 +64,6 @@ def test_mixed_marker_keeps_only_its_usable_labels() -> None:
         "Fact [E1, E9].",
         evidence=evidence,
         verified_chunk_ids={"chunk-1"},
-        allowed_document_ids={"doc-a"},
     )
 
     assert rendered.text == "Fact [1]."
@@ -77,7 +74,6 @@ def test_removed_marker_leaves_no_space_before_following_punctuation_or_double_g
         "Fact [E9] . Next [E9], then  kept spacing  here. Gap [E9]  here.",
         evidence={},
         verified_chunk_ids=set(),
-        allowed_document_ids=set(),
     )
 
     assert rendered.text == "Fact. Next, then  kept spacing  here. Gap here."
@@ -89,7 +85,6 @@ def test_removed_marker_at_the_start_leaves_no_leading_space() -> None:
         "[E9] Yes, it is. [E1] Next.",
         evidence={"E1": _chunk("chunk-1")},
         verified_chunk_ids={"chunk-1"},
-        allowed_document_ids={"doc-a"},
     )
 
     assert rendered.text == "Yes, it is. [1] Next."
@@ -102,7 +97,6 @@ def test_inline_disabled_removes_every_marker_and_returns_no_citations() -> None
         "Fact [E1] here [E9].",
         evidence=evidence,
         verified_chunk_ids={"chunk-1"},
-        allowed_document_ids={"doc-a"},
     )
 
     assert rendered.text == "Fact here."
@@ -119,7 +113,6 @@ def test_citation_section_joins_heading_path_and_is_none_without_headings() -> N
         "Quota [E1] and other [E2].",
         evidence=evidence,
         verified_chunk_ids={"chunk-1", "chunk-2"},
-        allowed_document_ids={"doc-a"},
     )
 
     assert rendered.citations == (
@@ -138,7 +131,6 @@ def test_text_outside_markers_is_left_unchanged() -> None:
         "Indented  text [E1]\n    code ,  kept",
         evidence=evidence,
         verified_chunk_ids={"chunk-1"},
-        allowed_document_ids={"doc-a"},
     )
 
     assert rendered.text == "Indented  text [1]\n    code ,  kept"
@@ -149,7 +141,6 @@ def test_adjacent_removed_markers_leave_one_separator_before_punctuation() -> No
         "The limit is 5 [E9] [E8]. Fact [E9] [E8], next. A [E9] [E8] b.",
         evidence={},
         verified_chunk_ids=set(),
-        allowed_document_ids=set(),
     )
 
     assert rendered.text == "The limit is 5. Fact, next. A b."
@@ -160,7 +151,6 @@ def test_valid_marker_followed_by_removed_marker_keeps_one_space() -> None:
         "Kept [E1] [E9] more.",
         evidence={"E1": _chunk("chunk-1")},
         verified_chunk_ids={"chunk-1"},
-        allowed_document_ids={"doc-a"},
     )
 
     assert rendered.text == "Kept [1] more."
@@ -171,7 +161,6 @@ def test_removed_markers_are_settled_when_inline_citations_are_disabled() -> Non
         "Fact [E1] [E2]. Next [E1], then.",
         evidence={"E1": _chunk("chunk-1"), "E2": _chunk("chunk-2")},
         verified_chunk_ids={"chunk-1", "chunk-2"},
-        allowed_document_ids={"doc-a"},
     )
 
     assert rendered.text == "Fact. Next, then."
@@ -195,7 +184,6 @@ def test_removed_marker_spacing_follows_the_text_around_it(answer: str, expected
         answer,
         evidence={"E1": _chunk("chunk-1")},
         verified_chunk_ids={"chunk-1"},
-        allowed_document_ids={"doc-a"},
     )
 
     assert rendered.text == expected
@@ -206,7 +194,6 @@ def test_bracketed_numbers_and_code_indexing_are_text_and_never_cited() -> None:
         "Use items[0] and arr[1] here [E1].",
         evidence={"E1": _chunk("chunk-1")},
         verified_chunk_ids={"chunk-1"},
-        allowed_document_ids={"doc-a"},
     )
 
     assert rendered.text == "Use items[0] and arr[1] here [1]."
@@ -221,3 +208,14 @@ def test_without_markers_removes_every_marker_for_conversation_history() -> None
     )
 
     assert stripped == "Limitations are cost and latency. Plain text. Code arr[1]."
+
+
+def test_sources_group_verified_sections_in_first_seen_order() -> None:
+    beta = _chunk("b", document_id="second", heading=("Start",))
+    alpha = _chunk("a", document_id="first", heading=())
+    detail = _chunk("c", document_id="second", heading=("Start", "Detail"))
+    sources = sources_from_chunks([beta, alpha, detail, beta])
+    assert [(s.document_id, s.sections) for s in sources] == [
+        ("second", ("Start", "Start > Detail")),
+        ("first", ()),
+    ]

@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from itertools import pairwise
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 def utc_now() -> datetime:
@@ -22,9 +32,10 @@ class FrozenModel(BaseModel):
 
 
 Role = Annotated[str, Field(min_length=1, max_length=128)]
+FILTER_KEY_PATTERN = r"^[A-Za-z][A-Za-z0-9_-]{0,127}$"
 FilterKey = Annotated[
     str,
-    Field(min_length=1, max_length=128, pattern=r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$"),
+    Field(min_length=1, max_length=128, pattern=FILTER_KEY_PATTERN),
 ]
 FilterString = Annotated[str, Field(max_length=512)]
 FilterInteger = Annotated[int, Field(ge=-(2**63), le=2**63 - 1)]
@@ -135,6 +146,16 @@ class QueryResponse(FrozenModel):
     metadata: QueryMetadata
 
 
+def _metadata_scalar(value: object) -> object:
+    # BSON 64-bit integers are int subclasses. BSON code is a str subclass with a distinct type.
+    if isinstance(value, int) or type(value) in (str, float):
+        return value
+    raise ValueError("Chunk metadata values must be strings, numbers or booleans")
+
+
+MetadataValue = Annotated[str | int | float | bool, BeforeValidator(_metadata_scalar)]
+
+
 class Chunk(FrozenModel):
     id: str
     tenant_id: str
@@ -146,11 +167,58 @@ class Chunk(FrozenModel):
     sequence: int
     heading_path: tuple[str, ...]
     text: str
-    token_count: int
+    token_count: int = Field(strict=True, gt=0)
     previous_chunk_id: str | None = None
     next_chunk_id: str | None = None
     allowed_roles: frozenset[str]
-    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    metadata: dict[str, MetadataValue] = Field(default_factory=dict)
+
+    @field_validator("token_count", mode="before")
+    @classmethod
+    def normalize_whole_double(cls, value: object) -> object:
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+
+    def passage_fields(self) -> dict[str, object]:
+        """The label-independent passage supplied to generation and evaluation."""
+        return {
+            "document": self.document_title,
+            "document_version": self.document_version,
+            "section": list(self.heading_path),
+            "content": self.text,
+        }
+
+    def matches_filters(self, filters: Mapping[str, str | int | float | bool]) -> bool:
+        for key, expected in filters.items():
+            value = self.metadata.get(key)
+            # A dotted vector path cannot be established from a flat scalar record.
+            if "." in key or value is None:
+                return False
+            if isinstance(expected, float):
+                # The vector manager uses a numeric range with equal endpoints.
+                if isinstance(value, bool) or value != expected:
+                    return False
+            elif type(value) is not type(expected) or value != expected:
+                return False
+        return True
+
+
+class EvidenceRef(FrozenModel):
+    chunk_id: str
+    document_id: str
+    document_version_id: str
+    passage_digest: str
+
+    @classmethod
+    def from_chunk(cls, chunk: Chunk) -> EvidenceRef:
+        passage = json.dumps(chunk.passage_fields(), sort_keys=True, separators=(",", ":"))
+        return cls(
+            chunk_id=chunk.id,
+            document_id=chunk.document_id,
+            document_version_id=chunk.document_version_id,
+            passage_digest=hashlib.sha256(passage.encode("utf-8")).hexdigest(),
+        )
 
 
 class SearchHit(FrozenModel):
@@ -494,7 +562,7 @@ class VerifiedAnswer:
     strategy: RetrievalStrategy
     generation_repaired: bool
     answered_requirements: int = 0
-    evidence: dict[str, Chunk] = field(default_factory=dict)
+    evidence_refs: dict[str, EvidenceRef] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

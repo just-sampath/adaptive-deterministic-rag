@@ -209,8 +209,9 @@ def test_search_passes_trusted_identity_and_records_completion(
     [
         b'{"message": "   "}',
         b'{"message": "question", "filters": {"score": NaN}}',
+        b'{"message": "question", "filters": {"section.name": "intro"}}',
     ],
-    ids=["whitespace-message", "nan-filter"],
+    ids=["whitespace-message", "nan-filter", "dotted-filter-key"],
 )
 def test_invalid_query_returns_location_and_type_without_echoing_input(
     make_settings: Callable[..., Settings],

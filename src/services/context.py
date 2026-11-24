@@ -6,9 +6,10 @@ import asyncio
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import cache
 
 from models.domain import Chunk, Identity, PackedContext, RankedChunk
-from services.contracts import DocumentReader, Reranker
+from services.contracts import DocumentReader, PassageTokenCounter, Reranker
 from utils.settings import ContextConfig
 
 _MID_LIST = re.compile(r"^\s*(?:[2-9]|\d{2,})[.)]\s")
@@ -53,10 +54,18 @@ class StructuralCompleter:
         self,
         seeds: Sequence[RankedChunk],
         identity: Identity,
+        *,
+        filters: Mapping[str, str | int | float | bool] | None = None,
     ) -> tuple[RankedChunk, ...]:
         unique = _first_by_id(seeds)
+        if self._max_neighbors_per_seed == 0:
+            return unique
         requested = {seed.chunk.id: self._requested(seed.chunk) for seed in unique}
         neighbors = await self._fetch(requested, identity)
+        if filters:
+            neighbors = {
+                key: chunk for key, chunk in neighbors.items() if chunk.matches_filters(filters)
+            }
         # A neighbour may be offered to several anchors; the packer places it once.
         seed_ids = {seed.chunk.id for seed in unique}
         completed: list[RankedChunk] = []
@@ -113,12 +122,16 @@ class StructuralCompleter:
 class ContextPacker:
     """Greedily pack ranked evidence within token, count, and document-share limits."""
 
-    def __init__(self, config: ContextConfig) -> None:
+    def __init__(self, config: ContextConfig, count_tokens: PassageTokenCounter) -> None:
         self._config = config
+        self._count_tokens = count_tokens
 
     def pack(self, candidates: Sequence[RankedChunk]) -> PackedContext:
         unique = _without_duplicate_seeds(candidates)
-        packing = _Packing(self._config, unique)
+        # Shared neighbors can appear under multiple anchors in this batch.
+        measure = cache(self._count_tokens)
+        costs = tuple(max(item.chunk.token_count, measure(item.chunk.text)) for item in unique)
+        packing = _Packing(self._config, unique, costs)
         for position, item in enumerate(unique):
             packing.offer(position, item)
         chunks = tuple(item for position, item in enumerate(unique) if position in packing.chosen)
@@ -132,10 +145,13 @@ class _Packing:
     at most once, under the first anchor whose seed was packed.
     """
 
-    def __init__(self, config: ContextConfig, candidates: Sequence[RankedChunk]) -> None:
+    def __init__(
+        self, config: ContextConfig, candidates: Sequence[RankedChunk], costs: Sequence[int]
+    ) -> None:
         self._config = config
         self._max_neighbors = config.max_seed_chunks * config.max_neighbors_per_seed
-        self._document_cap = _document_cap(config, candidates)
+        self._costs = costs
+        self._document_cap = _document_cap(config, candidates, costs)
         self._seed_decisions: dict[str, bool] = {}
         self._waiting: dict[str, list[tuple[int, RankedChunk]]] = {}
         self._chosen_ids: set[str] = set()
@@ -153,7 +169,7 @@ class _Packing:
 
     def _offer_seed(self, position: int, item: RankedChunk) -> None:
         chunk = item.chunk
-        packed = self._seeds < self._config.max_seed_chunks and self._fits(chunk)
+        packed = self._seeds < self._config.max_seed_chunks and self._fits(chunk, position)
         self._seed_decisions[chunk.id] = packed
         if packed:
             self._seeds += 1
@@ -167,31 +183,31 @@ class _Packing:
             return
         if anchor not in self._seed_decisions:
             self._waiting.setdefault(anchor, []).append((position, item))
-        elif self._admits_neighbor(anchor, item.chunk):
+        elif self._admits_neighbor(anchor, item.chunk, position):
             self._neighbors += 1
             self._take(position, item.chunk)
 
-    def _admits_neighbor(self, anchor: str, chunk: Chunk) -> bool:
+    def _admits_neighbor(self, anchor: str, chunk: Chunk, position: int) -> bool:
         return (
             self._seed_decisions[anchor]
             and chunk.id not in self._chosen_ids
             and self._neighbors < self._max_neighbors
-            and self._fits(chunk)
+            and self._fits(chunk, position)
         )
 
-    def _fits(self, chunk: Chunk) -> bool:
-        document_total = self._document_tokens.get(chunk.document_id, 0) + chunk.token_count
+    def _fits(self, chunk: Chunk, position: int) -> bool:
+        document_total = self._document_tokens.get(chunk.document_id, 0) + self._costs[position]
         return (
-            self.tokens + chunk.token_count <= self._config.max_tokens
+            self.tokens + self._costs[position] <= self._config.max_tokens
             and document_total <= self._document_cap
         )
 
     def _take(self, position: int, chunk: Chunk) -> None:
         self.chosen.add(position)
         self._chosen_ids.add(chunk.id)
-        self.tokens += chunk.token_count
+        self.tokens += self._costs[position]
         self._document_tokens[chunk.document_id] = (
-            self._document_tokens.get(chunk.document_id, 0) + chunk.token_count
+            self._document_tokens.get(chunk.document_id, 0) + self._costs[position]
         )
 
 
@@ -219,14 +235,15 @@ class ContextBuilder:
         query: str,
         candidates: Sequence[RankedChunk],
         identity: Identity,
+        filters: Mapping[str, str | int | float | bool] | None = None,
     ) -> ContextOutcome:
         async with asyncio.timeout(self._reranking_timeout_seconds):
             reranked = await self._reranker.rerank(query, candidates, len(candidates))
         seeds = reranked[: self._generation_k]
-        completed = await self._completer.complete(seeds, identity)
+        completed = await self._completer.complete(seeds, identity, filters=filters)
         return ContextOutcome(
             reranked_chunks=tuple(reranked),
-            packed_context=self._packer.pack(completed),
+            packed_context=await asyncio.to_thread(self._packer.pack, completed),
         )
 
 
@@ -325,8 +342,18 @@ def _without_duplicate_seeds(items: Sequence[RankedChunk]) -> tuple[RankedChunk,
     return tuple(kept)
 
 
-def _document_cap(config: ContextConfig, candidates: Sequence[RankedChunk]) -> int:
-    documents = {item.chunk.document_id for item in candidates}
+def utf8_byte_count(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _document_cap(
+    config: ContextConfig, candidates: Sequence[RankedChunk], costs: Sequence[int]
+) -> int:
+    documents = {
+        item.chunk.document_id
+        for item, cost in zip(candidates, costs, strict=True)
+        if not item.is_neighbor and cost <= config.max_tokens
+    }
     if len(documents) > 1:
         return int(config.max_tokens * config.max_document_share)
     return config.max_tokens

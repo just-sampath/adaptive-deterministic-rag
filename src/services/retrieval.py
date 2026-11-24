@@ -55,6 +55,8 @@ class RetrievalOutcome:
     embedding_usage: ModelUsage
     query_recovery_usage: ModelUsage
     model_calls: tuple[ModelCallTrace, ...] = ()
+    # Hydrated hits whose MongoDB metadata failed request filters that Qdrant had accepted.
+    metadata_mismatch_count: int = 0
 
 
 class QueryRecoveryService:
@@ -151,7 +153,8 @@ class HybridRetriever:
         hydrated = await self._repository.hydrate_authorized_chunks(
             [item.chunk_id for item in fused], identity
         )
-        authorized = [item for item in fused if item.chunk_id in hydrated]
+        present = [item for item in fused if item.chunk_id in hydrated]
+        authorized = [item for item in present if hydrated[item.chunk_id].matches_filters(filters)]
         ranked = tuple(
             RankedChunk(
                 chunk=hydrated[item.chunk_id],
@@ -174,6 +177,7 @@ class HybridRetriever:
             embedding_usage=encoded.usage,
             query_recovery_usage=ModelUsage(),
             model_calls=encoded.model_calls,
+            metadata_mismatch_count=len(present) - len(authorized),
         )
 
 
@@ -236,6 +240,7 @@ class StrategyRetriever:
             query_recovery_usage=variants.usage,
             model_calls=variants.model_calls
             + tuple(call for outcome in outcomes for call in outcome.model_calls),
+            metadata_mismatch_count=sum(item.metadata_mismatch_count for item in outcomes),
         )
 
 

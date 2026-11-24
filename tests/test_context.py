@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Sequence
 from typing import Any
 
 import pytest
 
 from models.domain import Chunk, Identity, RankedChunk
-from services.context import ContextBuilder, ContextPacker, StructuralCompleter
+from services.context import ContextBuilder, ContextPacker, StructuralCompleter, utf8_byte_count
 from tests.fakes import FakeRepository, FakeReranker, make_chunk
 from utils.settings import ContextConfig
 
@@ -244,7 +245,7 @@ async def test_reranking_is_bounded_by_its_stage_budget(identity: Identity) -> N
     builder = ContextBuilder(
         reranker=_StalledReranker(),
         completer=_completer(_Neighbors()),
-        packer=ContextPacker(_config()),
+        packer=ContextPacker(_config(), utf8_byte_count),
         generation_k=1,
         reranking_timeout_seconds=0.01,
     )
@@ -324,7 +325,7 @@ async def test_previous_neighbour_is_preferred_when_cap_allows_one(identity: Ide
     assert _ids(completed) == ["prev", "seed"]
 
 
-async def test_zero_neighbour_cap_keeps_seeds_only(identity: Identity) -> None:
+async def test_zero_neighbour_cap_returns_unique_seeds_without_a_lookup(identity: Identity) -> None:
     seed = _chunk(
         "seed",
         "This setting uses the following steps:",
@@ -333,9 +334,12 @@ async def test_zero_neighbour_cap_keeps_seeds_only(identity: Identity) -> None:
     )
     repository = _Neighbors(_chunk("prev"), _chunk("next"))
 
-    completed = await _completer(repository, max_neighbors=0).complete([_ranked(seed)], identity)
+    completed = await _completer(repository, max_neighbors=0).complete(
+        [_ranked(seed), _ranked(seed, 2)], identity
+    )
 
     assert _ids(completed) == ["seed"]
+    assert repository.requests == []
 
 
 async def test_unauthorized_neighbour_is_not_returned(identity: Identity) -> None:
@@ -392,11 +396,11 @@ async def test_shared_neighbour_is_packed_once_under_its_first_packed_anchor(
 ) -> None:
     first = _chunk("seed-a", "Use the following steps:", next_id="shared", tokens=100)
     second = _chunk("seed-b", "This setting applies.", previous_id="shared", tokens=100)
-    completed = await _completer(_Neighbors(_chunk("shared", tokens=50))).complete(
+    completed = await _completer(_Neighbors(_chunk("shared", "Shared.", tokens=50))).complete(
         [_ranked(first, 1), _ranked(second, 2)], identity
     )
 
-    packed = ContextPacker(_config()).pack(completed)
+    packed = ContextPacker(_config(), utf8_byte_count).pack(completed)
 
     assert _ids(packed.chunks) == ["seed-a", "shared", "seed-b"]
     assert packed.token_count == 250
@@ -407,14 +411,25 @@ async def test_shared_neighbour_packs_with_a_later_anchor_when_the_first_is_reje
 ) -> None:
     first = _chunk("seed-a", "Use the following steps:", next_id="shared", tokens=400)
     second = _chunk("seed-b", "This setting applies.", previous_id="shared", tokens=100)
-    completed = await _completer(_Neighbors(_chunk("shared", tokens=50))).complete(
+    completed = await _completer(_Neighbors(_chunk("shared", "Shared.", tokens=50))).complete(
         [_ranked(first, 1), _ranked(second, 2)], identity
     )
 
-    packed = ContextPacker(_config(max_tokens=300)).pack(completed)
+    measurements: list[str] = []
+
+    def count_tokens(text: str) -> int:
+        measurements.append(text)
+        return len(text)
+
+    packer = ContextPacker(_config(max_tokens=300), count_tokens)
+    packed = packer.pack(completed)
 
     assert _ids(packed.chunks) == ["shared", "seed-b"]
     assert packed.token_count == 150
+    assert sorted(measurements) == sorted({item.chunk.text for item in completed})
+    measurements.clear()
+    assert packer.pack(completed) == packed
+    assert sorted(measurements) == sorted({item.chunk.text for item in completed})
 
 
 async def test_chunks_without_signals_trigger_no_neighbour_fetch(identity: Identity) -> None:
@@ -460,7 +475,7 @@ async def test_builder_completes_only_generation_seeds(identity: Identity) -> No
     builder = ContextBuilder(
         reranker=FakeReranker(),
         completer=_completer(_Neighbors(_chunk("next-a"), _chunk("next-b"))),
-        packer=ContextPacker(_config()),
+        packer=ContextPacker(_config(), utf8_byte_count),
         generation_k=1,
         reranking_timeout_seconds=1,
     )
@@ -472,6 +487,29 @@ async def test_builder_completes_only_generation_seeds(identity: Identity) -> No
     )
 
     assert _ids(outcome.packed_context.chunks) == ["seed-a", "next-a"]
+
+
+async def test_builder_counts_the_batch_on_one_worker(identity: Identity) -> None:
+    threads: list[int] = []
+
+    def count_tokens(text: str) -> int:
+        threads.append(threading.get_ident())
+        return len(text)
+
+    builder = ContextBuilder(
+        reranker=FakeReranker(),
+        completer=_completer(_Neighbors()),
+        packer=ContextPacker(_config(), count_tokens),
+        generation_k=2,
+        reranking_timeout_seconds=1,
+    )
+    candidates = [_ranked(_chunk("first", "First.")), _ranked(_chunk("second", "Second."), 2)]
+
+    outcome = await builder.build(query="question", candidates=candidates, identity=identity)
+
+    assert _ids(outcome.packed_context.chunks) == ["first", "second"]
+    assert len(threads) == 2
+    assert threads[0] == threads[1] != threading.get_ident()
 
 
 def test_context_packer_limits_document_share_when_multiple_documents_exist() -> None:
@@ -494,13 +532,37 @@ def test_context_packer_limits_document_share_when_multiple_documents_exist() ->
             max_seed_chunks=3,
             max_document_share=0.5,
             max_neighbors_per_seed=0,
-        )
+        ),
+        utf8_byte_count,
     )
 
     context = packer.pack(ranked)
 
     assert [item.chunk.id for item in context.chunks] == [first.id, other_document.id]
     assert context.token_count == 200
+
+
+@pytest.mark.parametrize(
+    ("other_text", "other_count"),
+    [("short", 257), ("é" * 129, 20)],
+    ids=["oversized-count", "oversized-utf8"],
+)
+def test_only_document_with_a_packable_seed_can_use_the_full_budget(
+    other_text: str, other_count: int
+) -> None:
+    seed = make_chunk("seed", document_id="guide", text="é" * 128)
+    oversized = make_chunk("appendix", document_id="manual", text=other_text).model_copy(
+        update={"token_count": other_count}
+    )
+    neighbor = make_chunk("note", document_id="manual", text="A short note.")
+    candidates = [_ranked(seed), _ranked(oversized, 2), _neighbor(neighbor, oversized.id)]
+
+    packed = ContextPacker(_config(max_tokens=256, max_document_share=0.5), utf8_byte_count).pack(
+        candidates
+    )
+
+    assert _ids(packed.chunks) == [seed.id]
+    assert packed.token_count == 256
 
 
 def test_packed_neighbours_keep_reading_order_around_their_seed() -> None:
@@ -510,7 +572,7 @@ def test_packed_neighbours_keep_reading_order_around_their_seed() -> None:
         _neighbor(_chunk("next"), "seed"),
     ]
 
-    packed = ContextPacker(_config()).pack(candidates)
+    packed = ContextPacker(_config(), utf8_byte_count).pack(candidates)
 
     assert _ids(packed.chunks) == ["prev", "seed", "next"]
     assert packed.token_count == 600
@@ -527,7 +589,9 @@ def test_packer_caps_seeds_and_neighbours_independently() -> None:
         _ranked(_chunk("seed-3"), 3),
     ]
 
-    packed = ContextPacker(_config(max_seed_chunks=2, max_neighbors_per_seed=1)).pack(candidates)
+    packed = ContextPacker(
+        _config(max_seed_chunks=2, max_neighbors_per_seed=1), utf8_byte_count
+    ).pack(candidates)
 
     assert _ids(packed.chunks) == ["prev-1", "seed-1", "next-1", "seed-2"]
 
@@ -538,10 +602,10 @@ def test_neighbours_of_an_unpacked_seed_are_dropped_even_when_they_fit() -> None
         _neighbor(_chunk("prev-2", tokens=10), "seed-2"),
         _ranked(_chunk("seed-2", tokens=200), 2),
         _neighbor(_chunk("next-2", tokens=10), "seed-2"),
-        _ranked(_chunk("seed-3", tokens=50), 3),
+        _ranked(_chunk("seed-3", "Third.", tokens=50), 3),
     ]
 
-    packed = ContextPacker(_config(max_tokens=300)).pack(candidates)
+    packed = ContextPacker(_config(max_tokens=300), utf8_byte_count).pack(candidates)
 
     assert _ids(packed.chunks) == ["seed-1", "seed-3"]
     assert packed.token_count == 250
@@ -553,7 +617,7 @@ def test_neighbour_cannot_displace_its_seed_under_the_token_budget() -> None:
         _ranked(_chunk("seed", tokens=200)),
     ]
 
-    packed = ContextPacker(_config(max_tokens=256)).pack(candidates)
+    packed = ContextPacker(_config(max_tokens=256), utf8_byte_count).pack(candidates)
 
     assert _ids(packed.chunks) == ["seed"]
 
@@ -567,7 +631,9 @@ def test_neighbour_without_a_candidate_anchor_is_never_packed() -> None:
         is_neighbor=True,
     )
 
-    packed = ContextPacker(_config()).pack([orphan, unanchored, _ranked(_chunk("seed"))])
+    packed = ContextPacker(_config(), utf8_byte_count).pack(
+        [orphan, unanchored, _ranked(_chunk("seed"))]
+    )
 
     assert _ids(packed.chunks) == ["seed"]
 
@@ -579,7 +645,7 @@ def test_zero_neighbour_budget_packs_seeds_only() -> None:
         _neighbor(_chunk("next"), "seed"),
     ]
 
-    packed = ContextPacker(_config(max_neighbors_per_seed=0)).pack(candidates)
+    packed = ContextPacker(_config(max_neighbors_per_seed=0), utf8_byte_count).pack(candidates)
 
     assert _ids(packed.chunks) == ["seed"]
 
@@ -587,7 +653,64 @@ def test_zero_neighbour_budget_packs_seeds_only() -> None:
 def test_duplicate_candidates_are_packed_once() -> None:
     seed = _ranked(_chunk("seed"))
 
-    packed = ContextPacker(_config()).pack([seed, seed])
+    packed = ContextPacker(_config(), utf8_byte_count).pack([seed, seed])
 
     assert _ids(packed.chunks) == ["seed"]
     assert packed.token_count == 200
+
+
+@pytest.mark.parametrize(("language", "ids"), [("en", ["seed", "next"]), ("fr", ["seed"])])
+async def test_completion_respects_language_filter(
+    identity: Identity, language: str, ids: list[str]
+) -> None:
+    seed = _chunk("seed", "The following:", next_id="next").model_copy(
+        update={"metadata": {"lang": "en"}}
+    )
+    neighbor = _chunk("next").model_copy(update={"metadata": {"lang": language}})
+    result = await _completer(_Neighbors(neighbor)).complete(
+        [_ranked(seed)], identity, filters={"lang": "en"}
+    )
+    assert _ids(result) == ids
+
+
+@pytest.mark.parametrize(
+    ("text", "declared", "expected"),
+    [
+        ("é" * 512, 1, 0),
+        ("é" * 512 + "a", 1, 0),
+        ("a" * 1000, 256, 0),
+        ("Short.", 256, 256),
+        ("é" * 128, 1, 256),
+        ("é" * 128 + "a", 1, 0),
+    ],
+    ids=["unicode", "unicode-plus-ascii", "ascii", "declared-floor", "exact-fit", "one-over"],
+)
+def test_byte_packing_charges_the_greater_of_bytes_and_declared_count(
+    text: str, declared: int, expected: int
+) -> None:
+    chunk = make_chunk("page", text=text).model_copy(update={"token_count": declared})
+    result = ContextPacker(_config(max_tokens=256), utf8_byte_count).pack([_ranked(chunk)])
+    assert result.token_count == expected
+    assert bool(result.chunks) == bool(expected)
+
+
+@pytest.mark.parametrize(
+    ("text", "measured", "declared", "budget", "expected"),
+    [
+        (" Authentication is required for every transaction." * 50, 350, 350, 512, 350),
+        ("é" * 512, 512, 1, 256, 0),
+        ("é" * 256, 256, 1, 256, 256),
+        ("Short.", 2, 256, 256, 256),
+    ],
+    ids=["accurate-prose", "underdeclared-unicode", "exact-fit", "declared-floor"],
+)
+def test_tokenizer_packing_uses_the_greater_of_local_tokens_and_declared_count(
+    text: str, measured: int, declared: int, budget: int, expected: int
+) -> None:
+    chunk = make_chunk("page", text=text).model_copy(update={"token_count": declared})
+    counter = {text: measured}.__getitem__
+
+    result = ContextPacker(_config(max_tokens=budget), counter).pack([_ranked(chunk)])
+
+    assert result.token_count == expected
+    assert bool(result.chunks) == bool(expected)

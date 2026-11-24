@@ -6,8 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from models.domain import (
-    Chunk,
     CompletenessStatus,
+    EvidenceRef,
     FaithfulnessStatus,
     RagFailure,
     RagState,
@@ -64,7 +64,7 @@ class TerminalResult:
     unanswered_requirements: tuple[str, ...]
     strategy: RetrievalStrategy | None
     generation_repaired: bool
-    evidence: dict[str, Chunk] = field(default_factory=dict)
+    evidence_refs: dict[str, EvidenceRef] = field(default_factory=dict)
     degraded: bool = False
 
 
@@ -167,7 +167,7 @@ class DecisionPolicy:
         evaluation: EvaluationResult,
         strategy: RetrievalStrategy,
         repaired: bool,
-        evidence: dict[str, Chunk],
+        evidence_refs: dict[str, EvidenceRef],
     ) -> None:
         faithfulness = evaluation.faithfulness
         requirements = evaluation.completeness.requirements
@@ -183,7 +183,7 @@ class DecisionPolicy:
             strategy=strategy,
             generation_repaired=repaired,
             answered_requirements=answered,
-            evidence=evidence,
+            evidence_refs=evidence_refs,
         )
         best = state.best_verified_answer
         if best is None or _outranks(candidate, best):

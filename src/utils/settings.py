@@ -181,7 +181,14 @@ class ContextualizationConfig(ConfigModel):
     max_context_characters: int = Field(default=12_000, ge=500)
 
 
+class TokenizerEncoding(StrEnum):
+    UTF8_BYTES = "utf8_bytes"
+    O200K_BASE = "o200k_base"
+
+
 class ContextConfig(ConfigModel):
+    tokenizer_encoding: TokenizerEncoding = TokenizerEncoding.UTF8_BYTES
+    tokenizer_verified_for: str | None = None
     max_tokens: int = Field(default=8000, ge=256)
     max_seed_chunks: int = Field(default=8, ge=1)
     max_document_share: float = Field(default=0.4, gt=0, le=1)
@@ -301,6 +308,19 @@ class Settings(ConfigModel):
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     answers: AnswersConfig = Field(default_factory=AnswersConfig)
     external: ExternalSettings = Field(default_factory=ExternalSettings)
+
+    @model_validator(mode="after")
+    def validate_tokenizer_for_generation_model(self) -> Settings:
+        verified_for = self.context.tokenizer_verified_for
+        if self.context.tokenizer_encoding is TokenizerEncoding.UTF8_BYTES:
+            if verified_for is not None:
+                raise ValueError("context.tokenizer_verified_for must be null in utf8_bytes mode")
+        elif verified_for != self.ai.generation_model or not self.ai.generation_model.strip():
+            raise ValueError(
+                "context.tokenizer_verified_for must exactly match ai.generation_model "
+                "and must be nonblank in tokenizer mode"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_provider_configuration(self) -> Settings:

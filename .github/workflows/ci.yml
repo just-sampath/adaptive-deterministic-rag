@@ -19,6 +19,7 @@ jobs:
           python-version: "3.13.9"
           enable-cache: true
       - run: uv sync --frozen --all-groups
+      - run: uv run --frozen python -m scripts.prefetch_tokenizer
       - run: uv lock --check
       - run: uv run ruff format --check .
       - run: uv run ruff check .
