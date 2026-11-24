@@ -17,7 +17,15 @@ _CLOSING_PUNCTUATION = frozenset(".,;:!?)")
 @dataclass(frozen=True, slots=True)
 class RenderedAnswer:
     text: str
+    history_text: str
     citations: tuple[Citation, ...]
+
+    def with_disclosure(self, disclosure: str) -> RenderedAnswer:
+        return RenderedAnswer(
+            text=f"{self.text.rstrip()}\n\n{disclosure}",
+            history_text=f"{self.history_text.rstrip()}\n\n{disclosure}",
+            citations=self.citations,
+        )
 
 
 class CitationRenderer:
@@ -39,8 +47,10 @@ class CitationRenderer:
                 label: chunk for label, chunk in evidence.items() if chunk.id in verified_chunk_ids
             }
         numbers = _number_chunks(answer, usable)
+        text = _substitute(answer, usable, numbers)
         return RenderedAnswer(
-            text=_substitute(answer, usable, numbers),
+            text=text,
+            history_text=self.without_markers(answer) if numbers else text,
             citations=_citations(numbers, usable),
         )
 

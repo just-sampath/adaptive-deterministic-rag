@@ -197,7 +197,7 @@ class FakeRepository:
         self.current_versions = {chunk.document_id: chunk.document_version_id for chunk in chunks}
         self.traces: dict[str, RequestTrace] = {}
         self.events: list[TelemetryEvent] = []
-        self.messages: dict[str, list[ConversationMessage]] = defaultdict(list)
+        self.messages: dict[tuple[str, str, str], list[ConversationMessage]] = defaultdict(list)
         self.hydrate_calls: list[tuple[str, ...]] = []
 
     async def hydrate_authorized_chunks(
@@ -228,8 +228,7 @@ class FakeRepository:
         conversation_id: str,
         limit: int,
     ) -> tuple[ConversationMessage, ...]:
-        del identity
-        return tuple(self.messages[conversation_id][-limit:])
+        return tuple(self.messages[identity.tenant_id, identity.user_id, conversation_id][-limit:])
 
     async def append_messages(
         self,
@@ -237,8 +236,8 @@ class FakeRepository:
         conversation_id: str,
         messages: Sequence[ConversationMessage],
     ) -> None:
-        del identity
-        self.messages[conversation_id].extend(messages)
+        key = (identity.tenant_id, identity.user_id, conversation_id)
+        self.messages[key] = [*self.messages[key], *messages][-100:]
 
     async def write_events(self, events: Sequence[TelemetryEvent]) -> None:
         self.events.extend(events)

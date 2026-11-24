@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 
 from handlers.policy import DecisionPolicy
 from handlers.search import SearchHandler
@@ -19,8 +20,10 @@ from models.domain import (
     ContextualizationTrace,
     ConversationMessage,
     EncodedQuery,
+    EvidenceRef,
     FaithfulnessEvaluation,
     FaithfulnessStatus,
+    FollowupClassification,
     GenerationDraft,
     HybridHits,
     Identity,
@@ -40,8 +43,10 @@ from models.domain import (
 from providers.sparse import Bm25SparseEncoder
 from services.citations import CitationRenderer
 from services.context import ContextBuilder, ContextPacker, StructuralCompleter, utf8_byte_count
+from services.contracts import FollowupDetector
 from services.encoding import EmbeddingCache, HybridQueryEncoder
 from services.evaluation import GenerationService, OnlineEvaluator
+from services.followup import ModelFollowupDetector
 from services.retrieval import HybridRetriever, QueryRecoveryService, StrategyRetriever
 from services.telemetry import TelemetryService
 from services.understanding import QueryUnderstandingService
@@ -54,13 +59,16 @@ from tests.fakes import (
     FakeVectorSearch,
     make_chunk,
 )
+from tests.test_transport import TRUSTED_HEADERS, make_app, make_context
 from utils.errors import ProviderError, RequestDeadlineExceededError
+from utils.prompts import STANDARD_ABSTENTION
 from utils.settings import (
     ContentMode,
     ContextConfig,
     ContextualizationConfig,
     PolicyConfig,
     RetrievalConfig,
+    Settings,
     SparseConfig,
     TelemetryConfig,
     TimeoutConfig,
@@ -161,10 +169,12 @@ def build_orchestrator(
     repository: FakeRepository,
     vector_store: FakeVectorSearch,
     timeouts: TimeoutConfig | None = None,
-    detector: FakeFollowupDetector | None = None,
+    detector: FollowupDetector | None = None,
     inline_citations: bool = True,
     reranker: FakeReranker | None = None,
     max_neighbors: int = 0,
+    contextualization: ContextualizationConfig | None = None,
+    history_ref_limit: int = 8,
     telemetry: TelemetryService | None = None,
 ) -> SearchHandler:
     retrieval = RetrievalConfig(
@@ -182,7 +192,7 @@ def build_orchestrator(
         max_document_share=1,
         max_neighbors_per_seed=max_neighbors,
     )
-    contextualization = ContextualizationConfig()
+    contextualization = contextualization or ContextualizationConfig()
     policy = PolicyConfig()
     encoder = HybridQueryEncoder(
         dense=FakeEmbeddings(),
@@ -251,6 +261,7 @@ def build_orchestrator(
         policy=policy,
         retrieval=retrieval,
         contextualization=contextualization,
+        history_ref_limit=history_ref_limit,
         timeouts=timeouts if timeouts is not None else TimeoutConfig(),
         runtime_versions={"ai_provider": "fake", "embedding_model": "fake-embedding"},
         configuration_fingerprint="test-configuration",
@@ -676,15 +687,69 @@ async def test_provider_timeout_is_not_mislabeled_as_global_deadline(
     assert trace.error_code == "TimeoutError"
 
 
+@pytest.mark.parametrize("inline", [True, False])
+def test_partial_disclosure_survives_http_storage_and_the_next_model_prompts(
+    make_settings: Callable[..., Settings], inline: bool
+) -> None:
+    chunk = make_chunk(CHUNK_ID)
+    repository = FakeRepository((chunk,))
+    model = FakeTextModel()
+    model.queue(QueryRecoveryOutput, QueryRecoveryOutput())
+    draft = "Read `items[0]` and note [42] [E1]."
+    for _ in range(3):
+        model.queue(GenerationDraft, GenerationDraft(answer=draft))
+        model.queue(FaithfulnessEvaluation, _supported())
+        model.queue(CompletenessEvaluation, _partial_evaluation())
+    model.queue(FollowupClassification, FollowupClassification(is_followup_probability=1))
+    model.queue(ContextualizationOutput, ContextualizationOutput(standalone_question="Which note?"))
+    queue_complete_answer(model, "The note applies [E1].")
+    handler = build_orchestrator(
+        repository=repository,
+        model=model,
+        vector_store=hit_store(),
+        inline_citations=inline,
+        detector=ModelFollowupDetector(model=model, model_name="detector", max_output_tokens=128),
+    )
+    context = make_context(make_settings(), query=handler, repository=repository)
+    request = {"message": "Explain the feature", "conversation_id": "notes"}
+    with TestClient(make_app(context)) as client:
+        first = client.post("/v1/rag/query", headers=TRUSTED_HEADERS, json=request)
+        assert first.status_code == 200
+        answer = first.json()
+        assert answer["status"] == "VERIFIED_PARTIAL"
+        assert answer["unanswered_requirements"] == ["limitations"]
+        saved = repository.messages[("tenant-a", "user-a", "notes")][-1]
+        plain = "Read `items[0]` and note [42]."
+        suffix = "\n\nI could not verify from the available sources: limitations."
+        assert saved.content == plain + suffix
+        assert saved.evidence_refs == (EvidenceRef.from_chunk(chunk),)
+        displayed = "Read `items[0]` and note [42] [1]." if inline else plain
+        assert answer["answer"] == displayed + suffix
+        second = client.post(
+            "/v1/rag/query", headers=TRUSTED_HEADERS, json={**request, "message": "Which note?"}
+        )
+        assert second.status_code == 200
+    payloads = {kind: json.loads(prompt) for kind, prompt in model.output_prompts}
+    detector_lines = [
+        item["message"] for item in payloads[FollowupClassification]["conversation_history"]
+    ]
+    assert detector_lines == payloads[ContextualizationOutput]["conversation_history"]
+    assert detector_lines == ["user: Explain the feature", f"assistant: {saved.content}"]
+
+
 async def test_conversation_history_is_contextualized_recorded_and_extended(
     identity: Identity,
 ) -> None:
     repository = FakeRepository((make_chunk(CHUNK_ID),))
-    repository.messages["conversation-1"].extend(
+    key = (identity.tenant_id, identity.user_id, "conversation-1")
+    repository.messages[key].extend(
         [
             ConversationMessage(role="user", content="Tell me about migration"),
-            ConversationMessage(role="assistant", content="Migration is staged."),
-            ConversationMessage(role="user", content="Tell me more"),
+            ConversationMessage(
+                role="assistant",
+                content="Migration is staged.",
+                evidence_refs=(EvidenceRef.from_chunk(repository.chunks[CHUNK_ID]),),
+            ),
         ]
     )
     model = FakeTextModel()
@@ -712,12 +777,12 @@ async def test_conversation_history_is_contextualized_recorded_and_extended(
         detector="fake",
         followup_probability=1,
         fail_open=False,
-        history_messages=3,
-        selected_messages=3,
+        history_messages=2,
+        selected_messages=2,
         rewritten=True,
     )
-    assert repository.messages["conversation-1"][-2].content == "Explain the feature"
-    assert repository.messages["conversation-1"][-1].content == "Advantages."
+    assert repository.messages[key][-2].content == "Explain the feature"
+    assert repository.messages[key][-1].content == "Advantages."
     assert response.answer == "Advantages [1]."
 
 
@@ -757,14 +822,160 @@ async def test_later_turns_never_see_citation_markers_from_earlier_answers(
     assert "[E1]" not in contextualizer_prompt
 
 
+@pytest.mark.parametrize("case", ["current", "changed", "too_many"])
+async def test_final_read_and_saved_turn_include_dependencies_from_history(
+    identity: Identity, case: str
+) -> None:
+    previous, current = make_chunk("earlier", document_id="earlier-doc"), make_chunk(CHUNK_ID)
+
+    class Catalog(FakeRepository):
+        async def hydrate_authorized_chunks(
+            self, chunk_ids: Sequence[str], identity: Identity
+        ) -> dict[str, Chunk]:
+            if case == "changed" and {current.id, previous.id} == set(chunk_ids):
+                self.chunks[previous.id] = previous.model_copy(update={"text": "Revised edition."})
+            return await super().hydrate_authorized_chunks(chunk_ids, identity)
+
+    repository = Catalog((previous, current))
+    key = (identity.tenant_id, identity.user_id, "guide")
+    repository.messages[key].extend(
+        (
+            ConversationMessage(role="user", content="Which edition?"),
+            ConversationMessage(
+                role="assistant",
+                content="Previous edition.",
+                evidence_refs=(EvidenceRef.from_chunk(previous),),
+            ),
+        )
+    )
+    model = FakeTextModel()
+    queue_complete_answer(model, "Current edition [E1].")
+    detector = FakeFollowupDetector(probability=0)
+    handler = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=hit_store(),
+        detector=detector,
+        history_ref_limit=1 if case == "too_many" else 2,
+    )
+    request = QueryRequest(message="Next edition?", conversation_id="guide")
+    response = await handler.query(identity, request)
+    assert detector.detect_calls == 1
+    assert set(repository.hydrate_calls[-1]) == {current.id, previous.id}
+    saved = repository.messages[key][-1]
+    if case == "changed":
+        assert response.status is ResultStatus.INSUFFICIENT_EVIDENCE
+        assert response.unanswered_requirements == (request.message,)
+        assert response.sources == ()
+        assert response.citations == ()
+        assert saved.content == STANDARD_ABSTENTION
+        assert saved.evidence_refs == ()
+    else:
+        assert response.status is ResultStatus.COMPLETE
+        assert [source.document_id for source in response.sources] == [current.document_id]
+        if case == "too_many":
+            assert saved.evidence_refs is None
+            queue_complete_answer(model, "Current edition [E1].")
+            await handler.query(identity, request)
+            assert detector.detect_calls == 1
+        else:
+            assert saved.evidence_refs is not None
+            assert set(saved.evidence_refs) == {
+                EvidenceRef.from_chunk(current),
+                EvidenceRef.from_chunk(previous),
+            }
+
+
+async def test_disabled_contextualization_skips_history_but_still_writes_the_turn(
+    identity: Identity,
+) -> None:
+    class WriteOnly(FakeRepository):
+        async def get_messages(
+            self, identity: Identity, conversation_id: str, limit: int
+        ) -> tuple[ConversationMessage, ...]:
+            pytest.fail("Disabled contextualization must skip the read")
+
+    current = make_chunk(CHUNK_ID)
+    repository = WriteOnly((current,))
+    model = FakeTextModel()
+    queue_complete_answer(model, "Current edition [E1].")
+    handler = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=hit_store(),
+        contextualization=ContextualizationConfig(enabled=False),
+    )
+    await handler.query(identity, QueryRequest(message="Which edition?", conversation_id="guide"))
+    user, assistant = repository.messages[identity.tenant_id, identity.user_id, "guide"]
+    assert user.content == "Which edition?"
+    assert assistant.content == "Current edition."
+    assert assistant.evidence_refs == (EvidenceRef.from_chunk(current),)
+
+
+async def test_concurrent_users_reusing_a_conversation_id_get_separate_history(
+    identity: Identity,
+) -> None:
+    current = make_chunk(CHUNK_ID)
+    users = (identity, identity.model_copy(update={"user_id": "other-user"}))
+    history_chunks = [make_chunk(user.user_id, document_id=user.user_id) for user in users]
+    repository = FakeRepository((current, *history_chunks))
+    model = FakeTextModel()
+    for user, history_chunk in zip(users, history_chunks, strict=True):
+        repository.messages[user.tenant_id, user.user_id, "shared"].extend(
+            (
+                ConversationMessage(role="user", content="Which guide?"),
+                ConversationMessage(
+                    role="assistant",
+                    content=user.user_id,
+                    evidence_refs=(EvidenceRef.from_chunk(history_chunk),),
+                ),
+            )
+        )
+        model.queue(FollowupClassification, FollowupClassification(is_followup_probability=0))
+        queue_complete_answer(model, "Current edition [E1].")
+    handler = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=hit_store(),
+        detector=ModelFollowupDetector(model=model, model_name="detector", max_output_tokens=128),
+    )
+    await asyncio.gather(
+        *(
+            handler.query(
+                user, QueryRequest(message=f"Guide for {user.user_id}?", conversation_id="shared")
+            )
+            for user in users
+        )
+    )
+    prompts = [
+        json.loads(body) for kind, body in model.output_prompts if kind is FollowupClassification
+    ]
+    assert len(prompts) == 2
+    for user, history_chunk in zip(users, history_chunks, strict=True):
+        (prompt,) = [p for p in prompts if p["current_message"] == f"Guide for {user.user_id}?"]
+        assert [row["message"] for row in prompt["conversation_history"]] == [
+            "user: Which guide?",
+            f"assistant: {user.user_id}",
+        ]
+        messages = repository.messages[user.tenant_id, user.user_id, "shared"]
+        assert len(messages) == 4
+        refs = messages[-1].evidence_refs
+        assert refs is not None
+        assert set(refs) == {EvidenceRef.from_chunk(current), EvidenceRef.from_chunk(history_chunk)}
+
+
 async def test_contaminated_generation_is_retried_in_isolation_without_repeating_retrieval(
     identity: Identity,
 ) -> None:
     repository, vector_store = _bilingual_handbook()
-    repository.messages["conversation-1"].extend(
+    repository.messages[identity.tenant_id, identity.user_id, "conversation-1"].extend(
         [
             ConversationMessage(role="user", content="Tell me about migration"),
-            ConversationMessage(role="assistant", content="Migration is staged."),
+            ConversationMessage(
+                role="assistant",
+                content="Migration is staged.",
+                evidence_refs=(EvidenceRef.from_chunk(repository.chunks[CHUNK_ID]),),
+            ),
         ]
     )
     model = FakeTextModel()
@@ -1053,7 +1264,13 @@ async def test_final_evidence_uses_every_packed_passage(identity: Identity, chan
             return await super().hydrate_authorized_chunks(chunk_ids, identity)
 
     repository = UpdatedCatalog((first, sibling))
-    repository.messages["guide"].append(ConversationMessage(role="user", content="Handbooks"))
+    key = (identity.tenant_id, identity.user_id, "guide")
+    repository.messages[key].extend(
+        (
+            ConversationMessage(role="user", content="Handbooks"),
+            ConversationMessage(role="assistant", content=STANDARD_ABSTENTION, evidence_refs=()),
+        )
+    )
     store = hit_store()
     store.dense_hits.append(SearchHit(chunk_id=sibling.id, score=0.5, rank=2))
     model = FakeTextModel()
@@ -1116,7 +1333,8 @@ async def test_final_evidence_uses_every_packed_passage(identity: Identity, chan
         assert response.unanswered_requirements == (request.message,)
         assert response.sources == ()
         assert response.citations == ()
-        assert repository.messages["guide"][-1].content == response.answer
+        assert repository.messages[key][-1].content == response.answer
+        assert repository.messages[key][-1].evidence_refs == ()
         assert "handbook applies" not in response.answer
 
 
@@ -1158,4 +1376,7 @@ async def test_selected_partial_rechecks_its_own_evidence(
     assert response.status is ResultStatus.INSUFFICIENT_EVIDENCE
     assert response.sources == ()
     assert response.citations == ()
-    assert repository.messages["guide"][-1].content == response.answer
+    assert (
+        repository.messages[identity.tenant_id, identity.user_id, "guide"][-1].content
+        == response.answer
+    )

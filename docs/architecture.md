@@ -123,7 +123,8 @@ Queries and readiness checks always address the alias.
 
 | Condition | Deterministic action |
 |---|---|
-| Follow-up detected in the conversation | Rewrite into a standalone canonical question |
+| Request has a conversation ID and contextualization is enabled | Read the scoped tail, authorize complete pairs, and project a character-bounded window before detection |
+| Follow-up detected in that window | Rewrite into a standalone canonical question using selected messages |
 | Initial request | Run `HAPPY_PATH` |
 | Evaluators both pass | Select `COMPLETE` for final evidence checks |
 | Correctable generation failure and repair unused | Repair once, then reevaluate. Correctable means the answer omitted content the evidence holds, correcting evidence exists, or an otherwise complete answer has unsupported or contradicted claims to remove; never when the evidence lacks a requirement or no material claim is supported |
@@ -131,8 +132,8 @@ Queries and readiness checks always address the alias.
 | Budget spent and a verified partial answer exists | Select the best partial for final evidence checks |
 | No answer with verified support | Return `INSUFFICIENT_EVIDENCE` |
 | Attempt deadline or stage failure after a verified partial | Select the best partial for final evidence checks and mark it degraded |
-| All selected passages still match | Present the selected answer, its verified sources and any partial disclosure |
-| A selected passage disappeared, changed or no longer qualifies | Present and save the standard abstention with empty sources and citations |
+| All current and inherited evidence still matches | Present the selected answer and its current verified sources. Store the same partial disclosure with the plain-text answer |
+| A selected or inherited passage disappeared, changed or no longer qualifies | Present and save the standard abstention with empty sources and citations |
 | Final evidence read fails or times out | Propagate the operational error |
 | Provider or deadline failure with nothing verified | Raise a typed operational error |
 
@@ -141,8 +142,37 @@ configured `FollowupDetector` (`model`, `heuristic`, or `always`) returns a foll
 one relevance score per earlier message. If the detector times out or its provider fails, the
 request fails open and is treated as a follow-up. Below `followup_threshold` the literal question
 is used. Otherwise the rewrite model sees only the messages scored at or above `message_threshold`,
-plus the last `min_recent_messages`, in chronological order and within `max_context_characters`.
+plus the last `min_recent_messages` when they fit. Both stages count the exact chronological
+`role: content` strings against `max_context_characters`. A single oversized newest message
+contributes a suffix after its role prefix. The current question, JSON syntax and fixed prompt
+text are outside the limit. Detector indexes refer to this projected window.
 An empty rewrite falls back to the literal question.
+
+### Conversation history
+
+MongoDB reads at most `contextualization.history_messages` from the conversation selected by
+tenant, user and conversation ID. The service walks complete user/assistant pairs newest first.
+It stops at an unpaired turn, unknown provenance, conflicting snapshots, or a pair that exceeds
+the shared reference budget. Among pairs that fit the rendered window, it hydrates distinct chunk
+IDs in one authoritative read and keeps the contiguous suffix with eligible evidence. Each ref
+must still match the passage digest, document and version, ACL and request filters. A store
+failure propagates before detection. The source-free standard abstention alone can carry an
+empty reference set. Even a partial excerpt retains the whole pair's dependencies.
+
+The reference limit across the window and per saved turn is
+`history_messages × max_seed_chunks × (1 + max_neighbors_per_seed)`. Finalization rechecks
+the union of inherited refs and all packed refs from the winning attempt before delivery.
+Public sources and citations come only from the current winning evidence. If the combined
+refs exceed the persistence limit, save the presented history text with unknown provenance.
+
+The manager appends the user message and assistant history text in one update and retains the
+latest 100 messages. The history text omits generated evidence markers and keeps the same
+partial disclosure as the displayed answer. As in the displayed grammar, an `[E1]` spelling
+inside a code span is treated as a marker. Literal numeric brackets remain intact.
+Readers accept legacy and enriched messages. With `contextualization.write_history_provenance`
+disabled, writers emit exactly the legacy message keys. Enable it after all readers support
+enriched assistants. Once enriched writes begin, every rollback reader must support both formats.
+Existing history stays on disk. New writes still pair the turn when contextualization is disabled.
 
 `DecisionPolicy.decide_next` classifies each failed attempt; the first matching row wins:
 

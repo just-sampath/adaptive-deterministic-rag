@@ -92,7 +92,7 @@ from environment variables with no application prefix.
 | Source | Examples |
 | --- | --- |
 | `config/default.yaml` | Models, candidate budgets, follow-up detection, policy bounds, timeouts, collection alias, sparse encoder |
-| `config/local.yaml` | Local-only overrides: `DEBUG` logging and smaller telemetry queue and batch sizes |
+| `config/local.yaml` | Local-only overrides: `DEBUG` logging, conversation provenance writes, and smaller telemetry queue and batch sizes |
 | Environment / `.env` | API keys, MongoDB URI, Qdrant URL/key, trusted-header secrets |
 | Environment / `.env` | `APP_ENV`, `CONFIG_DIR`, and `TELEMETRY_HASH_KEY` |
 
@@ -109,6 +109,16 @@ Confirm the deployed generation model's encoding before enabling tokenizer mode.
 change requires updating the verification setting after checking the new deployment. Compare
 required evidence coverage on held-out questions before enabling this mode in production.
 
+| Conversation history setting | Default | Meaning |
+| --- | --- | --- |
+| `contextualization.write_history_provenance` | `false` | Save the evidence references a later turn needs before it can reuse this answer. |
+
+While this setting is `false`, saved turns keep the legacy message format and later requests
+cannot reuse them as history. `config/local.yaml` sets it to `true`, because a single local
+instance has no older readers. For other deployments, deploy history-compatible readers to every
+instance first, then set it to `true` in YAML. Once an enriched turn is stored, roll back only to a version that can read
+it. Disabling new writes leaves existing rows intact.
+
 `APP_ENV` defaults to `production` when unset, so a missing value fails closed. Production startup
 rejects the placeholder `AUTH_SHARED_TOKEN`, `DEBUG_TOKEN`, and `TELEMETRY_HASH_KEY` values, and it
 rejects any of the three that is shorter than 32 characters or equal to another of the three.
@@ -124,6 +134,7 @@ The complete environment surface is:
 APP_ENV=local
 CONFIG_DIR=config
 # Evidence packing is configured in YAML with context.tokenizer_encoding and context.tokenizer_verified_for.
+# Conversation history writes are configured in YAML with contextualization.write_history_provenance.
 OPENAI_API_KEY=
 OPENAI_BASE_URL=
 COHERE_API_KEY=
@@ -279,19 +290,27 @@ into the new physical collection, then switch the alias.
 
 ## Answers and conversational queries
 
-History is read only when a request has a `conversation_id` and `contextualization.enabled` is true.
-A follow-up detector (`contextualization.detector`: `model`, `heuristic`, or `always`) estimates
-whether the message depends on earlier turns. Below `followup_threshold` the literal question is
-used unchanged. Otherwise the rewrite sees only relevant turns (score at or above
-`message_threshold`, plus the last `min_recent_messages`), trimmed to `max_context_characters`.
-A detector timeout or infrastructure failure fails open: the message is treated as a follow-up of
-the whole history, still bounded by that limit.
+With a `conversation_id`, the service stores the user message and the assistant answer together.
+The stored answer preserves partial-answer disclosures and ordinary Markdown. Generated evidence
+markers are removed before citation numbering. The service reads history only when
+`contextualization.enabled` is true. It walks recent complete pairs for the same tenant, user and
+conversation, stopping at the first pair whose evidence it cannot verify against current access,
+document versions, passage content and request filters. Legacy turns remain stored. They cannot
+supply model input. With legacy-format writes enabled, newly saved turns also lack reusable
+provenance.
+
+The follow-up detector sees only the authorized tail. The rewriter selects relevant and recent
+messages from that same window. Each stage has a hard `max_context_characters` limit on the sum
+of its Unicode `role: content` strings. An oversized newest message contributes its role and a
+suffix of its text. The current question, JSON escaping and fixed prompt envelope are separate.
+A detector timeout can use only this already authorized and bounded history.
 
 Answers cite evidence with numbered markers such as `[1]` or `[1, 2]`. `citations` lists each cited
 passage once, numbered by first appearance. Markers that do not refer to verified evidence are
 removed. Setting `answers.inline_citations: false` removes all markers and returns no citations.
 Before delivery, MongoDB rechecks every packed passage from the selected answer, including
-uncited passages. If a passage is missing, loses eligibility, or changes its model-visible content,
+uncited passages and the evidence inherited from history supplied to the detector or rewriter.
+If a passage is missing, loses eligibility, or changes its model-visible content,
 the API returns `INSUFFICIENT_EVIDENCE` with the literal question as unanswered and empty sources
 and citations. A conversation turn stores the abstention, and a `rag.evidence.withdrawn` event
 records the reason and the status that was selected. A final store failure remains an error.

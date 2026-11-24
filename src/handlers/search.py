@@ -47,11 +47,12 @@ from services.evaluation import (
     GenerationService,
     OnlineEvaluator,
 )
+from services.history import authorized_history, evidence_withdrawal_reason
 from services.retrieval import RetrievalOutcome, StrategyRetriever
 from services.telemetry import TelemetryService
 from services.understanding import QueryUnderstandingService
 from utils.errors import InfrastructureError, RequestDeadlineExceededError
-from utils.prompts import PROMPT_VERSIONS
+from utils.prompts import PROMPT_VERSIONS, STANDARD_ABSTENTION
 from utils.request_context import current_request_id
 from utils.settings import ContextualizationConfig, PolicyConfig, RetrievalConfig, TimeoutConfig
 
@@ -69,6 +70,7 @@ class _RequestRecord:
     contextualization: ContextualizationTrace | None = None
     contextualization_usage: ModelUsage = field(default_factory=ModelUsage)
     contextualization_calls: tuple[ModelCallTrace, ...] = ()
+    history_refs: tuple[EvidenceRef, ...] = ()
     state: RagState | None = None
     terminal: TerminalResult | None = None
     error_code: str | None = None
@@ -90,6 +92,7 @@ class _Outcome:
     terminal: TerminalResult
     sources: tuple[Source, ...]
     presented: RenderedAnswer
+    history_refs: tuple[EvidenceRef, ...] | None
 
 
 class SearchHandler:
@@ -112,6 +115,7 @@ class SearchHandler:
         policy: PolicyConfig,
         retrieval: RetrievalConfig,
         contextualization: ContextualizationConfig,
+        history_ref_limit: int,
         timeouts: TimeoutConfig,
         runtime_versions: dict[str, str],
         configuration_fingerprint: str,
@@ -130,6 +134,7 @@ class SearchHandler:
         self._policy = policy
         self._retrieval_config = retrieval
         self._contextualization = contextualization
+        self._history_ref_limit = history_ref_limit
         self._timeouts = timeouts
         self._runtime_versions = runtime_versions
         self._configuration_fingerprint = configuration_fingerprint
@@ -163,12 +168,7 @@ class SearchHandler:
                 terminal = await self._answer(record, request, start)
                 record.terminal = terminal
                 outcome = await self._authorize_answer(record, terminal, request)
-                # History keeps plain text so rendered markers never re-enter a later prompt.
-                await self._append_turn(
-                    record.identity,
-                    request,
-                    self._citations.without_markers(outcome.terminal.answer),
-                )
+                await self._append_turn(record.identity, request, outcome)
         except TimeoutError as exc:
             if not deadline.expired():
                 raise
@@ -181,22 +181,21 @@ class SearchHandler:
         self, record: _RequestRecord, terminal: TerminalResult, request: QueryRequest
     ) -> _Outcome:
         refs = terminal.evidence_refs
-        if not refs:
-            return _Outcome(terminal, (), self._present(terminal, {}))
+        if terminal.status is ResultStatus.INSUFFICIENT_EVIDENCE:
+            return _Outcome(terminal, (), self._present(terminal, {}), ())
 
-        current = await self._documents.hydrate_authorized_chunks(
-            [ref.chunk_id for ref in refs.values()], record.identity
-        )
-        evidence: dict[str, Chunk] = {}
-        for label, ref in refs.items():
-            chunk = current.get(ref.chunk_id)
-            reason = _withdrawal_reason(ref, chunk, request.filters)
-            if chunk is None or reason is not None:
-                return self._withdraw(record, terminal, request, reason or "unavailable")
-            evidence[label] = chunk
+        required = tuple(dict.fromkeys((*refs.values(), *record.history_refs)))
+        chunk_ids = list(dict.fromkeys(ref.chunk_id for ref in required))
+        current = await self._documents.hydrate_authorized_chunks(chunk_ids, record.identity)
+        for ref in required:
+            reason = evidence_withdrawal_reason(ref, current.get(ref.chunk_id), request.filters)
+            if reason is not None:
+                return self._withdraw(record, terminal, request, reason)
 
+        evidence = {label: current[ref.chunk_id] for label, ref in refs.items()}
         sources = sources_from_chunks([current[key] for key in terminal.verified_chunk_ids])
-        return _Outcome(terminal, sources, self._present(terminal, evidence))
+        saved_refs = required if 0 < len(required) <= self._history_ref_limit else None
+        return _Outcome(terminal, sources, self._present(terminal, evidence), saved_refs)
 
     def _withdraw(
         self, record: _RequestRecord, terminal: TerminalResult, request: QueryRequest, reason: str
@@ -214,7 +213,7 @@ class SearchHandler:
             },
         )
         abstention = _abstain(request.message, terminal.strategy, terminal.generation_repaired)
-        return _Outcome(abstention, (), self._present(abstention, {}))
+        return _Outcome(abstention, (), self._present(abstention, {}), ())
 
     async def _answer(
         self,
@@ -246,7 +245,7 @@ class SearchHandler:
             return salvaged
 
     async def _attempt(self, record: _RequestRecord, request: QueryRequest) -> TerminalResult:
-        history = await self._history(record.identity, request)
+        history, record.history_refs = await self._history(record.identity, request)
         understood = await self._query_understanding.understand(request.message, history)
         record.contextualization = understood.trace
         record.contextualization_usage = understood.usage
@@ -266,16 +265,26 @@ class SearchHandler:
         self,
         identity: Identity,
         request: QueryRequest,
-    ) -> tuple[ConversationMessage, ...]:
+    ) -> tuple[tuple[ConversationMessage, ...], tuple[EvidenceRef, ...]]:
         if not request.conversation_id or not self._contextualization.enabled:
-            return ()
-        return await self._conversations.get_messages(
+            return (), ()
+        messages = await self._conversations.get_messages(
             identity,
             request.conversation_id,
             self._contextualization.history_messages,
         )
+        return await authorized_history(
+            messages,
+            documents=self._documents,
+            identity=identity,
+            filters=request.filters,
+            reference_limit=self._history_ref_limit,
+            character_limit=self._contextualization.max_context_characters,
+        )
 
-    async def _append_turn(self, identity: Identity, request: QueryRequest, answer: str) -> None:
+    async def _append_turn(
+        self, identity: Identity, request: QueryRequest, outcome: _Outcome
+    ) -> None:
         if not request.conversation_id:
             return
         await self._conversations.append_messages(
@@ -283,7 +292,11 @@ class SearchHandler:
             request.conversation_id,
             (
                 ConversationMessage(role="user", content=request.message),
-                ConversationMessage(role="assistant", content=answer),
+                ConversationMessage(
+                    role="assistant",
+                    content=outcome.presented.history_text,
+                    evidence_refs=outcome.history_refs,
+                ),
             ),
         )
 
@@ -302,10 +315,7 @@ class SearchHandler:
             + "; ".join(terminal.unanswered_requirements)
             + "."
         )
-        return RenderedAnswer(
-            text=f"{rendered.text.rstrip()}\n\n{disclosure}",
-            citations=rendered.citations,
-        )
+        return rendered.with_disclosure(disclosure)
 
     async def _execute(self, state: RagState, request: QueryRequest) -> TerminalResult:
         strategy = RetrievalStrategy.HAPPY_PATH
@@ -734,27 +744,10 @@ def _conversation_facts(state: RagState, plan: StrategyPlan) -> tuple[str, ...]:
     return () if plan.isolate_conversation else state.query.relevant_conversation_context
 
 
-def _withdrawal_reason(
-    ref: EvidenceRef, chunk: Chunk | None, filters: Mapping[str, str | int | float | bool]
-) -> str | None:
-    """Name why a packed passage can no longer support the answer, or None when it still can."""
-    if chunk is None:
-        # Deleted, superseded by a new version, or no longer readable by this caller.
-        return "unavailable"
-    if not chunk.matches_filters(filters):
-        return "metadata"
-    if EvidenceRef.from_chunk(chunk) != ref:
-        return "changed"
-    return None
-
-
 def _abstain(question: str, strategy: RetrievalStrategy | None, repaired: bool) -> TerminalResult:
     return TerminalResult(
         status=ResultStatus.INSUFFICIENT_EVIDENCE,
-        answer=(
-            "I could not find sufficient information in the available documents "
-            "to answer this reliably."
-        ),
+        answer=STANDARD_ABSTENTION,
         verified_chunk_ids=(),
         unanswered_requirements=(question,),
         strategy=strategy,

@@ -22,7 +22,7 @@ from models.domain import (
 )
 from services.contracts import FollowupDetector, TextModel
 from utils.errors import InfrastructureError
-from utils.prompts import CONTEXTUALIZER_SYSTEM, contextualization_user_prompt
+from utils.prompts import CONTEXTUALIZER_SYSTEM, contextualization_user_prompt, history_line
 from utils.settings import ContextualizationConfig
 from utils.text import ENGLISH_STOPWORDS
 
@@ -76,6 +76,29 @@ class UnderstandingResult:
     usage: ModelUsage
     trace: ContextualizationTrace
     model_calls: tuple[ModelCallTrace, ...] = ()
+
+
+def project_history(
+    history: Sequence[ConversationMessage], limit: int
+) -> tuple[ConversationMessage, ...]:
+    """Fit a contiguous tail into a Unicode character budget, including role prefixes.
+
+    Only an oversized newest message is excerpted. Its suffix retains any trailing disclosure
+    and the copy keeps the original message's provenance.
+    """
+
+    recent: list[ConversationMessage] = []
+    remaining = limit
+    for message in reversed(history):
+        prefix_length = len(history_line(message.role, ""))
+        available = remaining - prefix_length
+        if len(message.content) > available:
+            if not recent and available > 0:
+                recent.append(message.model_copy(update={"content": message.content[-available:]}))
+            break
+        recent.append(message)
+        remaining -= prefix_length + len(message.content)
+    return tuple(reversed(recent))
 
 
 def query_drift_score(literal: str, canonical: str) -> float:
@@ -178,6 +201,7 @@ class QueryUnderstandingService:
     ) -> UnderstandingResult:
         if not self._config.enabled:
             return _literal(question, ContextualizationTrace(enabled=False), ModelUsage(), ())
+        history = project_history(history, self._config.max_context_characters)
         trace = ContextualizationTrace(
             enabled=True,
             detector=self._detector.name,
@@ -195,11 +219,11 @@ class QueryUnderstandingService:
         detection_calls = _calls(detection)
         if detection.is_followup_probability < self._config.followup_threshold:
             return _literal(question, trace, detection.usage, detection_calls)
-        selected = _select_indices(history, detection.message_scores, self._config)
+        selected = _select_history(history, detection.message_scores, self._config)
         trace = trace.model_copy(update={"selected_messages": len(selected)})
         if not selected:
             return _literal(question, trace, detection.usage, detection_calls)
-        rewrite = await self._rewrite(question, [history[index] for index in selected])
+        rewrite = await self._rewrite(question, selected)
         return _rewritten(
             question,
             rewrite,
@@ -213,7 +237,7 @@ class QueryUnderstandingService:
         question: str,
         history: Sequence[ConversationMessage],
     ) -> tuple[FollowupDecision, bool]:
-        """Return the detector decision, failing open to a full-history follow-up on errors."""
+        """Return the decision, using the bounded input window if detection fails."""
 
         try:
             async with asyncio.timeout(self._detection_timeout_seconds):
@@ -232,7 +256,7 @@ class QueryUnderstandingService:
         question: str,
         messages: Sequence[ConversationMessage],
     ) -> ModelResult[ContextualizationOutput]:
-        history_lines = [_history_line(message) for message in messages]
+        history_lines = [history_line(message.role, message.content) for message in messages]
         async with asyncio.timeout(self._contextualization_timeout_seconds):
             return await self._model.complete(
                 model=self._model_name,
@@ -243,53 +267,22 @@ class QueryUnderstandingService:
             )
 
 
-def _select_indices(
+def _select_history(
     history: Sequence[ConversationMessage],
     scores: Sequence[float],
     config: ContextualizationConfig,
-) -> tuple[int, ...]:
-    """Return the chronological history indices needed to interpret the current message."""
+) -> tuple[ConversationMessage, ...]:
+    """Select relevant and recent messages using the detector's local indices."""
 
     total = len(history)
     recent = frozenset(range(max(total - config.min_recent_messages, 0), total))
     relevant = {
         index for index, score in enumerate(scores[:total]) if score >= config.message_threshold
     }
-    return _within_character_budget(
-        history,
-        sorted(relevant | recent),
-        recent,
+    return project_history(
+        [history[index] for index in sorted(relevant | recent)],
         config.max_context_characters,
     )
-
-
-def _within_character_budget(
-    history: Sequence[ConversationMessage],
-    indices: Sequence[int],
-    recent: frozenset[int],
-    limit: int,
-) -> tuple[int, ...]:
-    """Drop the oldest non-recent messages until the rendered history fits the limit.
-
-    When the limit is still exceeded after every non-recent message is gone, only the recent
-    messages remain.
-    """
-
-    kept = list(indices)
-    for index in indices:
-        if _rendered_length(history, kept) <= limit:
-            break
-        if index not in recent:
-            kept.remove(index)
-    return tuple(kept)
-
-
-def _rendered_length(history: Sequence[ConversationMessage], indices: Sequence[int]) -> int:
-    return sum(len(_history_line(history[index])) for index in indices)
-
-
-def _history_line(message: ConversationMessage) -> str:
-    return f"{message.role}: {message.content}"
 
 
 def _calls(decision: FollowupDecision) -> tuple[ModelCallTrace, ...]:

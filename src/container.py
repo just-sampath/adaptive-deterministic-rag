@@ -182,7 +182,11 @@ def _compose(
             index=index,
             vector_manager=vector_manager,
             documents=documents,
-            conversations=MongoConversationManager(database),
+            conversations=MongoConversationManager(
+                database,
+                write_provenance=settings.contextualization.write_history_provenance,
+                max_history_refs=settings.history_ref_limit,
+            ),
             reranker=clients.reranker,
             telemetry=telemetry,
         ),
@@ -357,6 +361,7 @@ def _build_query_handler(
         policy=settings.policy,
         retrieval=settings.retrieval,
         contextualization=settings.contextualization,
+        history_ref_limit=settings.history_ref_limit,
         timeouts=settings.timeouts,
         runtime_versions=_runtime_versions(
             settings,

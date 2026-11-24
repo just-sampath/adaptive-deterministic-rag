@@ -2,6 +2,10 @@
 app:
   log_level: DEBUG
 
+contextualization:
+  # A single local instance has no older readers to wait for.
+  write_history_provenance: true
+
 telemetry:
   queue_capacity: 500
   batch_size: 25

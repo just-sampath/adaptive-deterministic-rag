@@ -42,6 +42,23 @@ def test_local_yaml_overlays_stable_defaults(tmp_path: Path) -> None:
     assert settings.retrieval.happy_dense_k == 40
 
 
+def test_committed_local_overlay_alone_enables_history_provenance() -> None:
+    def committed(environment: Environment) -> Settings:
+        return load_settings(
+            ExternalSettings(
+                _env_file=None,
+                app_env=environment,
+                config_dir=_PROJECT_CONFIG,
+                openai_api_key="test-key",
+                cohere_api_key="test-key",
+            )
+        )
+
+    assert committed(Environment.LOCAL).contextualization.write_history_provenance is True
+    default = yaml.safe_load((_PROJECT_CONFIG / "default.yaml").read_text(encoding="utf-8"))
+    assert default["contextualization"]["write_history_provenance"] is False
+
+
 def test_committed_default_yaml_matches_code_defaults() -> None:
     values = yaml.safe_load((_PROJECT_CONFIG / "default.yaml").read_text(encoding="utf-8"))
 
@@ -101,6 +118,26 @@ def test_settings_reject_unknown_stable_configuration_key(
 ) -> None:
     with pytest.raises(ValidationError, match="extra_forbidden"):
         make_settings(retrieval={"candidate_typo": 50})
+
+
+def test_history_provenance_requires_explicit_opt_in(
+    make_settings: Callable[..., Settings],
+) -> None:
+    assert make_settings().contextualization.write_history_provenance is False
+    settings = make_settings(
+        contextualization={"write_history_provenance": True, "history_messages": 3},
+        context={"max_seed_chunks": 2, "max_neighbors_per_seed": 2},
+    )
+    assert settings.contextualization.write_history_provenance is True
+    assert settings.history_ref_limit == 18
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, None])
+def test_history_provenance_write_flag_rejects_non_booleans(
+    make_settings: Callable[..., Settings], value: object
+) -> None:
+    with pytest.raises(ValidationError, match="bool_type"):
+        make_settings(contextualization={"write_history_provenance": value})
 
 
 def test_unverified_deployment_defaults_to_byte_counting(

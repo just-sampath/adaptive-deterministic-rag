@@ -172,6 +172,7 @@ class FollowupDetectorName(StrEnum):
 
 class ContextualizationConfig(ConfigModel):
     enabled: bool = True
+    write_history_provenance: bool = Field(default=False, strict=True)
     detector: FollowupDetectorName = FollowupDetectorName.MODEL
     detector_model: str = "gpt-5.6-luna"  # stand-in until the jev adapter exists
     history_messages: int = Field(default=30, ge=1, le=100)
@@ -308,6 +309,15 @@ class Settings(ConfigModel):
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     answers: AnswersConfig = Field(default_factory=AnswersConfig)
     external: ExternalSettings = Field(default_factory=ExternalSettings)
+
+    @property
+    def history_ref_limit(self) -> int:
+        """Maximum distinct dependencies in one history window or saved turn."""
+        return (
+            self.contextualization.history_messages
+            * self.context.max_seed_chunks
+            * (1 + self.context.max_neighbors_per_seed)
+        )
 
     @model_validator(mode="after")
     def validate_tokenizer_for_generation_model(self) -> Settings:

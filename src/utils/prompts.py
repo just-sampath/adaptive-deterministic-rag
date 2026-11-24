@@ -14,6 +14,10 @@ from models.domain import (
     evidence_label,
 )
 
+STANDARD_ABSTENTION = (
+    "I could not find sufficient information in the available documents to answer this reliably."
+)
+
 PROMPT_VERSIONS = {
     "contextualizer": "query_contextualizer:v1",
     "followup_detector": "followup_detector:v1",
@@ -71,6 +75,12 @@ is_followup_probability (0-1): the probability that the message cannot be unders
 retrieved correctly on its own. For every history message that could be needed, return its index
 and the probability that it is needed. Prefer recall: when unsure, give a higher probability.
 Do not answer the question."""
+
+
+def history_line(role: str, content: str) -> str:
+    """Render one message for both conversation prompts."""
+
+    return f"{role}: {content}"
 
 
 def contextualization_user_prompt(question: str, history: Sequence[str]) -> str:

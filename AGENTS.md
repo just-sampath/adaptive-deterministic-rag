@@ -71,6 +71,9 @@ There is no separate build step. `docker compose up --build` builds and runs the
   seeds and neighbors. Before presenting or storing an answer, revalidate every packed passage
   from the winning attempt, including its model-visible content. Derive public sources and
   citations from that final read.
+- Authorize conversation pairs before either history-consuming stage. Recheck inherited evidence
+  with the winning attempt before delivery. Preserve the partial disclosure when saving a turn.
+  Deploy compatible readers everywhere before enabling enriched conversation writes.
 - `scripts/seed_dummy_data.py` is the only vector writer, and it refuses to run unless
   `APP_ENV=local`. No file under `src/` writes Qdrant points or imports `scripts`
   (`tests/test_seed_boundary.py` enforces both). Don't add an ingestion or write route.

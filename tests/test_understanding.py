@@ -354,21 +354,63 @@ async def test_character_cap_drops_oldest_non_recent_messages_first() -> None:
     assert result.trace.selected_messages == 2
 
 
-async def test_character_cap_falls_back_to_recent_messages_when_still_over() -> None:
+async def test_oversized_newest_message_fits_both_prompts_and_keeps_its_disclosure() -> None:
     model = RecordingTextModel()
+    model.queue(FollowupClassification, FollowupClassification(is_followup_probability=1.0))
     model.queue(ContextualizationOutput, ContextualizationOutput(standalone_question="Q"))
-    recent = "recent " + "x" * 600
-    config = ContextualizationConfig(min_recent_messages=1, max_context_characters=500)
+    disclosure = "Unanswered: renewal date."
+    content = "Earlier context " + "🦉" * 600 + disclosure
+    latest = ConversationMessage(role="assistant", content=content)
     service = make_service(
-        detector=FakeFollowupDetector(probability=1.0),
+        detector=ModelFollowupDetector(model=model, model_name="detector", max_output_tokens=64),
         model=model,
-        config=config,
+        config=ContextualizationConfig(min_recent_messages=2, max_context_characters=500),
     )
 
-    result = await service.understand("Why?", make_history("old", "older", recent))
+    result = await service.understand("Why?", [*make_history("old", "older"), latest])
 
-    assert prompted_history(model) == [f"user: {recent}"]
+    entries = json.loads(model.user_prompts[0])["conversation_history"]
+    lines = prompted_history(model)
+    assert sum(len(entry["message"]) for entry in entries) == 500
+    assert sum(map(len, lines)) == 500
+    assert entries == [{"index": 0, "message": lines[0]}]
+    assert lines == ["assistant: " + content[-489:]]
+    assert latest.content == content
+    assert result.trace.history_messages == 1
     assert result.trace.selected_messages == 1
+
+
+async def test_exact_fit_relevance_indexes_refer_to_the_trimmed_window() -> None:
+    model = RecordingTextModel()
+    model.queue(
+        FollowupClassification,
+        FollowupClassification(
+            is_followup_probability=1.0,
+            message_relevance=(MessageRelevance(index=0, probability=1.0),),
+        ),
+    )
+    model.queue(ContextualizationOutput, ContextualizationOutput(standalone_question="Q"))
+    service = make_service(
+        detector=ModelFollowupDetector(model=model, model_name="detector", max_output_tokens=64),
+        model=model,
+        config=ContextualizationConfig(min_recent_messages=0, max_context_characters=500),
+    )
+    first = "Δ" * 200 + '"\n'
+    second = "🦉" * 281
+    history = [
+        *make_history("omit me", first),
+        ConversationMessage(role="assistant", content=second),
+    ]
+
+    await service.understand("Why?", history)
+
+    entries = json.loads(model.user_prompts[0])["conversation_history"]
+    assert sum(len(entry["message"]) for entry in entries) == 500
+    assert entries == [
+        {"index": 0, "message": "user: " + first},
+        {"index": 1, "message": "assistant: " + second},
+    ]
+    assert prompted_history(model) == ["user: " + first]
 
 
 async def test_rewrite_returns_canonical_question_and_conversation_context() -> None:
@@ -418,7 +460,7 @@ async def test_blank_rewrite_falls_back_to_literal_question() -> None:
     assert result.usage.total_tokens == 15
 
 
-async def test_detection_timeout_fails_open_to_full_history_rewrite() -> None:
+async def test_detection_timeout_fails_open_to_bounded_history_rewrite() -> None:
     model = RecordingTextModel()
     model.queue(
         ContextualizationOutput,
@@ -427,15 +469,16 @@ async def test_detection_timeout_fails_open_to_full_history_rewrite() -> None:
     service = make_service(
         detector=HangingDetector(),
         model=model,
+        config=ContextualizationConfig(min_recent_messages=2, max_context_characters=500),
         detection_timeout_seconds=0.01,
     )
 
-    result = await service.understand("And its limits?", make_history("m0", "m1"))
+    result = await service.understand("And its limits?", make_history("old", "x" * 600, "new"))
 
     assert result.trace.fail_open is True
     assert result.trace.followup_probability == 1.0
     assert result.trace.detector == "hanging"
-    assert prompted_history(model) == ["user: m0", "user: m1"]
+    assert prompted_history(model) == ["user: new"]
     assert result.query.canonical_question == "Rewritten question"
 
 

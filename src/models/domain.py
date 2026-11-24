@@ -94,12 +94,6 @@ class Identity(FrozenModel):
     roles: frozenset[Role] = Field(min_length=1, max_length=64)
 
 
-class ConversationMessage(FrozenModel):
-    role: str
-    content: str
-    created_at: datetime = Field(default_factory=utc_now)
-
-
 class QueryRequest(FrozenModel):
     conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=16_000)
@@ -208,7 +202,7 @@ class EvidenceRef(FrozenModel):
     chunk_id: str
     document_id: str
     document_version_id: str
-    passage_digest: str
+    passage_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @classmethod
     def from_chunk(cls, chunk: Chunk) -> EvidenceRef:
@@ -219,6 +213,13 @@ class EvidenceRef(FrozenModel):
             document_version_id=chunk.document_version_id,
             passage_digest=hashlib.sha256(passage.encode("utf-8")).hexdigest(),
         )
+
+
+class ConversationMessage(FrozenModel):
+    role: str
+    content: str
+    created_at: datetime = Field(default_factory=utc_now)
+    evidence_refs: tuple[EvidenceRef, ...] | None = None
 
 
 class SearchHit(FrozenModel):
