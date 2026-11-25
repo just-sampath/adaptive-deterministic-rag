@@ -15,6 +15,14 @@ class InfrastructureError(RagError):
     """Raised when a required database or provider is unavailable."""
 
 
+class TransientTraceWriteError(InfrastructureError):
+    """The store could not confirm an immutable trace write; it can be replayed."""
+
+
+class TraceConflictError(InfrastructureError):
+    """A tenant/request key already identifies a different immutable trace."""
+
+
 class ProviderError(InfrastructureError):
     """Raised when an external model or retrieval provider fails."""
 

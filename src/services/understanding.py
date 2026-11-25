@@ -25,6 +25,7 @@ from services.contracts import FollowupDetector, TextModel
 from services.query_anchors import preserves_explicit_anchors
 from utils.errors import InfrastructureError
 from utils.prompts import CONTEXTUALIZER_SYSTEM, contextualization_user_prompt, history_line
+from utils.request_context import observed_call
 from utils.settings import ContextualizationConfig
 from utils.text import ENGLISH_STOPWORDS
 
@@ -284,12 +285,16 @@ class QueryUnderstandingService:
     ) -> ModelResult[ContextualizationOutput]:
         history_lines = [history_line(message.role, message.content) for message in messages]
         async with asyncio.timeout(self._contextualization_timeout_seconds):
-            return await self._model.complete(
-                model=self._model_name,
-                system_prompt=CONTEXTUALIZER_SYSTEM,
-                user_prompt=contextualization_user_prompt(question, history_lines),
-                output_type=ContextualizationOutput,
-                max_output_tokens=self._max_output_tokens,
+            return await observed_call(
+                "contextualization",
+                self._model_name,
+                self._model.complete(
+                    model=self._model_name,
+                    system_prompt=CONTEXTUALIZER_SYSTEM,
+                    user_prompt=contextualization_user_prompt(question, history_lines),
+                    output_type=ContextualizationOutput,
+                    max_output_tokens=self._max_output_tokens,
+                ),
             )
 
 

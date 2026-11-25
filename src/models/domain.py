@@ -56,6 +56,13 @@ class ResultStatus(StrEnum):
     INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
 
 
+class HandlerOutcome(StrEnum):
+    UNKNOWN = "unknown"
+    RETURNED = "returned"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class FaithfulnessStatus(StrEnum):
     SUPPORTED = "SUPPORTED"
     UNSUPPORTED_CLAIMS = "UNSUPPORTED_CLAIMS"
@@ -444,6 +451,68 @@ class ModelCallTrace(FrozenModel):
     usage: ModelUsage = Field(default_factory=ModelUsage)
 
 
+class OperationStatus(StrEnum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    REUSED = "reused"
+
+
+class UsageCoverage(StrEnum):
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+    UNKNOWN = "unknown"
+
+
+class RerankMetering(FrozenModel):
+    """Native response counters. Billed units and inference tokens are separate."""
+
+    billed_units: dict[str, float] = Field(default_factory=dict)
+    input_tokens: float | None = None
+    output_tokens: float | None = None
+    cached_tokens: float | None = None
+
+    def token_usage(self) -> ModelUsage | None:
+        """Add reported inference tokens to integer totals only when the counts are integral."""
+        counters = (self.input_tokens, self.output_tokens, self.cached_tokens)
+        if all(value is None for value in counters) or any(
+            value is not None and not value.is_integer() for value in counters
+        ):
+            return None
+        inputs, outputs, cached = (int(value or 0) for value in counters)
+        return ModelUsage(
+            input_tokens=inputs,
+            output_tokens=outputs,
+            total_tokens=inputs + outputs,
+            cached_input_tokens=cached,
+        )
+
+
+class RerankResult(list[RankedChunk]):
+    """Ranked chunks with optional provider response metadata."""
+
+    def __init__(
+        self, chunks: list[RankedChunk], *, request_id: str | None, metering: RerankMetering | None
+    ) -> None:
+        super().__init__(chunks)
+        self.request_id = request_id
+        self.metering = metering
+
+
+class ProviderOperation(FrozenModel):
+    slot: int
+    operation: str
+    strategy: RetrievalStrategy | None
+    strategy_try: int | None
+    repair_ordinal: int
+    status: OperationStatus
+    provider: str | None = None
+    model: str | None = None
+    request_id: str | None = None
+    usage: ModelUsage | None = None
+    rerank_metering: RerankMetering | None = None
+
+
 class SparseEmbedding(FrozenModel):
     """Provider-neutral sparse vector with strictly increasing uint32 indices."""
 
@@ -572,6 +641,8 @@ class ContextualizationTrace(FrozenModel):
 
 
 class RequestTrace(FrozenModel):
+    operations: tuple[ProviderOperation, ...] | None = None
+    usage_coverage: UsageCoverage = UsageCoverage.UNKNOWN
     request_id: str
     tenant_id: str
     user_id: str
@@ -582,6 +653,9 @@ class RequestTrace(FrozenModel):
     attempts: tuple[AttemptTrace, ...]
     final_status: ResultStatus | None
     final_source_ids: tuple[str, ...]
+    handler_outcome: HandlerOutcome = HandlerOutcome.UNKNOWN
+    returned_status: ResultStatus | None = None
+    returned_document_ids: tuple[str, ...] | None = None
     latency_ms: float
     token_usage: ModelUsage
     model_calls: tuple[ModelCallTrace, ...] = ()

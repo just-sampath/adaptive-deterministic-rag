@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any, cast
@@ -8,12 +9,13 @@ from typing import Any, cast
 import pytest
 from openai import AsyncOpenAI, OpenAIError
 
-from models.domain import EmbeddingResult, ModelUsage
+from models.domain import EmbeddingResult, ModelUsage, OperationStatus, UsageCoverage
 from providers.openai import OpenAIEmbeddingProvider, build_openai_client
 from providers.sparse import Bm25SparseEncoder
 from services.encoding import EmbeddingCache, HybridQueryEncoder
 from tests.fakes import FakeEmbeddings
 from utils.errors import ProviderError, ProviderResponseError
+from utils.request_context import OperationCollector, collect_operations
 from utils.settings import SparseConfig
 
 
@@ -341,3 +343,85 @@ async def test_build_openai_client_applies_retry_budget() -> None:
 
     assert client.max_retries == 3
     await client.close()
+
+
+async def test_only_the_request_that_made_the_shared_embedding_call_reports_its_usage() -> None:
+    release = asyncio.Event()
+
+    class GatedEmbeddings(FakeEmbeddings):
+        async def embed_query(self, text: str) -> EmbeddingResult:
+            await release.wait()
+            return await super().embed_query(text)
+
+    dense = GatedEmbeddings()
+    encoder = HybridQueryEncoder(
+        dense=dense,
+        sparse=Bm25SparseEncoder(SparseConfig()),
+        cache=EmbeddingCache(8),
+        embedding_timeout_seconds=1,
+    )
+
+    async def request() -> OperationCollector:
+        with collect_operations() as collector:
+            await encoder.encode("shared question")
+            return collector
+
+    leader = asyncio.create_task(request())
+    await asyncio.sleep(0)
+    follower = asyncio.create_task(request())
+    await asyncio.sleep(0)
+    release.set()
+    collectors = await asyncio.gather(leader, follower)
+
+    assert dense.query_calls == 1
+    (made,), (reused,) = (collector.snapshot() for collector in collectors)
+    assert made.status is OperationStatus.COMPLETED
+    assert made.request_id == "embedding-1"
+    assert made.usage == ModelUsage(input_tokens=2, total_tokens=2)
+    assert reused.status is OperationStatus.REUSED
+    assert reused.usage is None and reused.request_id is None
+    totals = [collector.summary()[0].total_tokens for collector in collectors]
+    assert totals == [2, 0]
+    assert [collector.summary()[1] for collector in collectors] == [UsageCoverage.COMPLETE] * 2
+
+
+@pytest.mark.parametrize("leader_outcome", ["failed", "cancelled"])
+async def test_a_follower_that_shared_nothing_records_no_reuse(leader_outcome: str) -> None:
+    provider = GatedEmbeddings(failures=int(leader_outcome == "failed"))
+    cache = EmbeddingCache(max_entries=4)
+
+    async def request() -> OperationCollector:
+        with collect_operations() as collector, contextlib.suppress(ProviderError):
+            await cache.get_or_create("query", provider)
+        return collector
+
+    leader = asyncio.create_task(request())
+    await asyncio.sleep(0)
+    follower = asyncio.create_task(request())
+    await asyncio.sleep(0)
+    if leader_outcome == "cancelled":
+        leader.cancel()
+    provider.release.set()
+    await asyncio.gather(leader, return_exceptions=True)
+    rows = (await follower).snapshot()
+
+    if leader_outcome == "failed":
+        # The follower raised the leader's error and made no call of its own.
+        assert rows == ()
+    else:
+        # The follower became the leader and made its own call; it reused nothing.
+        assert [row.status for row in rows] == [OperationStatus.COMPLETED]
+        assert rows[0].request_id == "gated-2"
+
+
+async def test_encoding_without_a_request_collector_still_works() -> None:
+    encoder = HybridQueryEncoder(
+        dense=FakeEmbeddings(),
+        sparse=Bm25SparseEncoder(SparseConfig()),
+        cache=EmbeddingCache(8),
+        embedding_timeout_seconds=1,
+    )
+
+    encoded = await encoder.encode("question")
+
+    assert encoded.usage.total_tokens == 2

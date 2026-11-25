@@ -14,6 +14,7 @@ from pydantic import BaseModel, ValidationError
 
 from models.domain import EmbeddingResult, ModelResult, ModelUsage
 from utils.errors import OperationTimeoutError, ProviderError, ProviderResponseError
+from utils.request_context import observe_response, operation
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 _EMBEDDING_BATCH_SIZE = 256
@@ -59,42 +60,51 @@ class OpenAITextModel:
         output_type: type[SchemaT],
         max_output_tokens: int,
     ) -> ModelResult[SchemaT]:
-        try:
-            response = await self._client.responses.create(
-                model=model,
-                input=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                text={"format": structured_output_format(output_type)},
-                max_output_tokens=max_output_tokens,
-                store=False,
-                reasoning=self._reasoning(model),
+        with operation("text", model, provider="openai", adapter=True):
+            try:
+                response = await self._client.responses.create(
+                    model=model,
+                    input=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    text={"format": structured_output_format(output_type)},
+                    max_output_tokens=max_output_tokens,
+                    store=False,
+                    reasoning=self._reasoning(model),
+                )
+            except APITimeoutError as exc:
+                raise OperationTimeoutError("OpenAI structured model call timed out") from exc
+            except OpenAIError as exc:
+                raise ProviderError("OpenAI structured model call failed") from exc
+            usage = _response_usage(response.usage)
+            request_id = getattr(response, "_request_id", None)
+            observe_response(
+                provider="openai",
+                model=response.model,
+                request_id=request_id,
+                usage=usage if response.usage is not None else None,
             )
-        except APITimeoutError as exc:
-            raise OperationTimeoutError("OpenAI structured model call timed out") from exc
-        except OpenAIError as exc:
-            raise ProviderError("OpenAI structured model call failed") from exc
-        if response.status == "incomplete":
-            reason = getattr(response.incomplete_details, "reason", "unknown")
-            msg = f"OpenAI response was incomplete: {reason}"
-            raise ProviderResponseError(msg)
-        if not response.output_text:
-            msg = "OpenAI returned no structured output"
-            raise ProviderResponseError(msg)
+            if response.status == "incomplete":
+                reason = getattr(response.incomplete_details, "reason", "unknown")
+                msg = f"OpenAI response was incomplete: {reason}"
+                raise ProviderResponseError(msg)
+            if not response.output_text:
+                msg = "OpenAI returned no structured output"
+                raise ProviderResponseError(msg)
 
-        try:
-            parsed = output_type.model_validate_json(response.output_text)
-        except ValidationError:
-            # Validation errors embed the model's output, so the error is replaced, not chained.
-            raise ProviderResponseError("OpenAI structured output was invalid") from None
-        return ModelResult(
-            value=parsed,
-            model=response.model,
-            provider="openai",
-            usage=_response_usage(response.usage),
-            request_id=getattr(response, "_request_id", None),
-        )
+            try:
+                parsed = output_type.model_validate_json(response.output_text)
+            except ValidationError:
+                # Validation errors embed the model's output, so the error is replaced, not chained.
+                raise ProviderResponseError("OpenAI structured output was invalid") from None
+            return ModelResult(
+                value=parsed,
+                model=response.model,
+                provider="openai",
+                usage=usage,
+                request_id=request_id,
+            )
 
     def _reasoning(self, model: str) -> Reasoning | Omit:
         effort = self._reasoning_effort.get(model)
@@ -172,40 +182,51 @@ class OpenAIEmbeddingProvider:
         return results
 
     async def _request_embeddings(self, texts: Sequence[str]) -> list[EmbeddingResult]:
-        try:
-            response = await self._client.embeddings.create(
-                model=self._model,
-                input=list(texts),
-                dimensions=self._dimension,
-                encoding_format="float",
+        with operation("embedding", self._model, provider="openai", adapter=True):
+            try:
+                response = await self._client.embeddings.create(
+                    model=self._model,
+                    input=list(texts),
+                    dimensions=self._dimension,
+                    encoding_format="float",
+                )
+            except APITimeoutError as exc:
+                raise OperationTimeoutError("OpenAI embedding call timed out") from exc
+            except OpenAIError as exc:
+                raise ProviderError("OpenAI embedding call failed") from exc
+            request_id = getattr(response, "_request_id", None)
+            batch_usage = (
+                ModelUsage(
+                    input_tokens=response.usage.prompt_tokens,
+                    total_tokens=response.usage.total_tokens,
+                )
+                if response.usage is not None
+                else ModelUsage()
             )
-        except APITimeoutError as exc:
-            raise OperationTimeoutError("OpenAI embedding call timed out") from exc
-        except OpenAIError as exc:
-            raise ProviderError("OpenAI embedding call failed") from exc
-        ordered = sorted(response.data, key=lambda item: item.index)
-        if len(ordered) != len(texts):
-            raise ProviderResponseError("OpenAI returned an unexpected embedding count")
-        if any(len(item.embedding) != self._dimension for item in ordered):
-            raise ProviderResponseError(
-                "Embedding dimension does not match configured vector collection"
-            )
-        request_id = getattr(response, "_request_id", None)
-        batch_usage = ModelUsage(
-            input_tokens=response.usage.prompt_tokens,
-            total_tokens=response.usage.total_tokens,
-        )
-        # The batch usage is reported once, so summing results matches the billed total.
-        return [
-            EmbeddingResult(
-                vector=item.embedding,
-                model=response.model,
+            observe_response(
                 provider="openai",
-                usage=batch_usage if position == 0 else ModelUsage(),
+                model=response.model,
                 request_id=request_id,
+                usage=batch_usage if response.usage is not None else None,
             )
-            for position, item in enumerate(ordered)
-        ]
+            ordered = sorted(response.data, key=lambda item: item.index)
+            if len(ordered) != len(texts):
+                raise ProviderResponseError("OpenAI returned an unexpected embedding count")
+            if any(len(item.embedding) != self._dimension for item in ordered):
+                raise ProviderResponseError(
+                    "Embedding dimension does not match configured vector collection"
+                )
+            # The batch usage is reported once, so summing results matches the billed total.
+            return [
+                EmbeddingResult(
+                    vector=item.embedding,
+                    model=response.model,
+                    provider="openai",
+                    usage=batch_usage if position == 0 else ModelUsage(),
+                    request_id=request_id,
+                )
+                for position, item in enumerate(ordered)
+            ]
 
 
 def _response_usage(usage: object | None) -> ModelUsage:

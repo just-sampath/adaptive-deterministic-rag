@@ -23,6 +23,7 @@ from services.contracts import DocumentReader, QueryEncoder, TextModel, VectorSe
 from services.understanding import query_drift_score
 from utils.concurrency import run_all
 from utils.prompts import QUERY_RECOVERY_SYSTEM, query_recovery_user_prompt
+from utils.request_context import observed_call
 from utils.settings import FusionStrategy, RetrievalConfig
 
 
@@ -81,12 +82,16 @@ class QueryRecoveryService:
 
     async def build(self, query: QueryUnderstanding) -> QueryVariants:
         async with asyncio.timeout(self._timeout_seconds):
-            result = await self._model.complete(
-                model=self._model_name,
-                system_prompt=QUERY_RECOVERY_SYSTEM,
-                user_prompt=query_recovery_user_prompt(query),
-                output_type=QueryRecoveryOutput,
-                max_output_tokens=self._max_output_tokens,
+            result = await observed_call(
+                "query_recovery",
+                self._model_name,
+                self._model.complete(
+                    model=self._model_name,
+                    system_prompt=QUERY_RECOVERY_SYSTEM,
+                    user_prompt=query_recovery_user_prompt(query),
+                    output_type=QueryRecoveryOutput,
+                    max_output_tokens=self._max_output_tokens,
+                ),
             )
         # A rewritten follow-up whose words all survived the rewrite ("what about the second
         # one?") adds nothing as a search of its own. When the rewrite dropped some of the user's

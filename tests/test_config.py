@@ -61,9 +61,22 @@ def test_committed_local_overlay_alone_enables_history_provenance() -> None:
 
     assert committed(Environment.LOCAL).contextualization.write_history_provenance is True
     assert committed(Environment.LOCAL).policy.verify_answers is True
+    assert committed(Environment.LOCAL).telemetry.write_accounting_fields is True
     default = yaml.safe_load((_PROJECT_CONFIG / "default.yaml").read_text(encoding="utf-8"))
     assert default["contextualization"]["write_history_provenance"] is False
     assert default["policy"]["verify_answers"] is False
+    assert default["telemetry"]["write_accounting_fields"] is False
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_trace_accounting_flag_is_strict(
+    make_settings: Callable[..., Settings], value: object
+) -> None:
+    assert make_settings(
+        telemetry={"write_accounting_fields": True}
+    ).telemetry.write_accounting_fields
+    with pytest.raises(ValidationError, match="bool_type"):
+        make_settings(telemetry={"write_accounting_fields": value})
 
 
 @pytest.mark.parametrize("value", ["true", 1, None])

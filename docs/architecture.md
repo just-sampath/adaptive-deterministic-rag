@@ -333,10 +333,33 @@ store no verdicts and keep the generation usage actually spent. A stored attempt
 `outcome` is a legacy record, read with its verdicts as they were stored. With verification
 disabled, writers emit exactly the legacy attempt layout and the previous prompt versions.
 
+Each request collects one record per provider call in a task-local `OperationCollector`. A slot is
+reserved before the call is awaited and tagged with the stage, strategy, strategy try and repair
+ordinal; the adapter fills it as soon as the SDK reply arrives, before parsing, so a reply that
+then fails validation keeps its reported usage. A call that fails or is cancelled without a reply
+has unknown usage, and an embedding cache hit or single-flight follower is recorded as reuse with
+no usage. `RequestTrace.token_usage` sums only reported usage across these records,
+`model_calls` lists every call that received a reply, `usage_coverage` says whether every call
+reported its usage, and attempt records keep their own totals. `handler_outcome` (`returned`, `failed`, `cancelled`, or `unknown` for older traces),
+`returned_status` and `returned_document_ids` describe what the handler gave the route, separately
+from `final_status` and `final_source_ids`, which keep the selected verdict and its verified chunk
+IDs. The `http.request.completed` event adds `response_started` and `response_completed`, each set
+only after the server's ASGI `send` for the start or the final body returned. With
+`telemetry.write_accounting_fields` disabled, writers omit the call records and the outcome fields.
+
 The queue prevents MongoDB telemetry latency from extending a completed RAG response. A pending
 trace stays readable in-process until it is written, and the pending set is capped at the queue
-capacity. After shutdown begins, traces are written directly under a short timeout. Shutdown waits
-a bounded time for the writer to flush, then cancels it. Queue saturation, sink failures, and
+capacity. Traces take priority over routine events, both in admission (a trace evicts the newest
+waiting event when the queue is full) and in service (each batch serves waiting traces first).
+The MongoDB sink writes each trace with an insert-only upsert on the unique tenant and request
+ID index, then confirms by reading from the primary that a matched record is the same trace, so
+a transient failure part-way through a batch is retried once by the worker with the identical
+records. A conflicting stored trace and a permanent failure are not retried. A trace saved
+before the writer starts is written directly under `telemetry.direct_write_timeout_seconds`;
+once shutdown begins, new traces are refused and counted, and new events are ignored. `close` sets one monotonic
+deadline and charges draining, the retry and cancellation to it; a writer still running at the
+deadline is cancelled and its batch counted as abandoned, and the container then closes the
+clients. Queue saturation, sink failures, and
 server-side request failures (deadline, timeout, provider, unexpected) produce structured stderr
 logs with request IDs, and those failures also emit `http.request.failed`; client errors appear in
 `http.request.completed` with their status code. The JSON formatter writes a logged exception as

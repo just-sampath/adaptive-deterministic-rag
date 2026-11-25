@@ -9,6 +9,7 @@ from dataclasses import replace
 
 from models.domain import EmbeddingResult, EncodedQuery, ModelCallTrace, ModelUsage
 from services.contracts import EmbeddingProvider, SparseEncoder
+from utils.request_context import observed_call, operation
 
 
 class EmbeddingCache:
@@ -21,13 +22,14 @@ class EmbeddingCache:
 
     async def get_or_create(self, text: str, provider: EmbeddingProvider) -> EmbeddingResult:
         if self._max_entries == 0:
-            return await provider.embed_query(text)
+            return await observed_call("embedding", provider.model, provider.embed_query(text))
         key = _cache_key(provider.fingerprint, text)
         while True:
             cached = self._values.get(key)
             if cached is not None:
                 self._values.move_to_end(key)
-                return _cache_hit(cached)
+                with operation("embedding", provider.model, reused=True):
+                    return _cache_hit(cached)
             pending = self._inflight.get(key)
             if pending is None:
                 return await self._fill(key, text, provider)
@@ -35,13 +37,17 @@ class EmbeddingCache:
             # the waiter loops back and becomes the leader under its own budget.
             await asyncio.wait({pending})
             if not pending.cancelled():
-                return _cache_hit(pending.result())
+                # A failed leader's error is re-raised here. Only a value actually shared is
+                # recorded as reuse; the leader's request owns the call and its outcome.
+                shared = pending.result()
+                with operation("embedding", provider.model, reused=True):
+                    return _cache_hit(shared)
 
     async def _fill(self, key: str, text: str, provider: EmbeddingProvider) -> EmbeddingResult:
         future: asyncio.Future[EmbeddingResult] = asyncio.get_running_loop().create_future()
         self._inflight[key] = future
         try:
-            result = await provider.embed_query(text)
+            result = await observed_call("embedding", provider.model, provider.embed_query(text))
         except asyncio.CancelledError:
             # The leader's own cancellation (timeout or disconnect) is not a provider failure.
             future.cancel()

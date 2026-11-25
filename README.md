@@ -93,7 +93,7 @@ from environment variables with no application prefix.
 | Source | Examples |
 | --- | --- |
 | `config/default.yaml` | Models, candidate budgets, follow-up detection, policy bounds, timeouts, collection alias, sparse encoder |
-| `config/local.yaml` | Local-only overrides: `DEBUG` logging, conversation provenance writes, answer verification, and smaller telemetry queue and batch sizes |
+| `config/local.yaml` | Local-only overrides: `DEBUG` logging, conversation provenance writes, answer verification, trace accounting fields, and smaller telemetry queue and batch sizes |
 | Environment / `.env` | API keys, MongoDB URI, Qdrant URL/key, trusted-header secrets |
 | Environment / `.env` | `APP_ENV`, `CONFIG_DIR`, and `TELEMETRY_HASH_KEY` |
 
@@ -137,6 +137,17 @@ an attempt rejected before judging has no verdicts to store in the old layout. W
 deployments, upgrade every trace reader first. After enabling it, roll back only to a reader that
 accepts attempts with an outcome and citation assessments.
 
+| Trace accounting setting | Default | Meaning |
+| --- | --- | --- |
+| `telemetry.write_accounting_fields` | `false` | Store each provider call, whether the reported usage is complete, what the handler returned, and the returned document IDs in new request traces. |
+
+Request totals always come from every provider call the request made, including calls of an attempt
+that a failed judge or a cancellation cut short. `telemetry.write_accounting_fields` adds the
+per-call records and the handler outcome to stored traces. While it is `false`, new MongoDB rows
+keep the previous top-level keys and pending traces read the same way. `config/local.yaml` sets it
+to `true`. For other deployments, upgrade every trace reader first, and after enabling it roll back
+only to a reader that accepts these fields.
+
 `APP_ENV` defaults to `production` when unset, so a missing value fails closed. Production startup
 rejects the placeholder `AUTH_SHARED_TOKEN`, `DEBUG_TOKEN`, and `TELEMETRY_HASH_KEY` values, and it
 rejects any of the three that is shorter than 32 characters or equal to another of the three.
@@ -162,6 +173,7 @@ CONFIG_DIR=config
 # Conversation history writes are configured in YAML with contextualization.write_history_provenance.
 # Query rewrite diagnostics are configured in YAML with telemetry.write_query_intent_fields.
 # Answer verification is configured in YAML with policy.verify_answers.
+# Trace accounting fields are configured in YAML with telemetry.write_accounting_fields.
 OPENAI_API_KEY=
 OPENAI_BASE_URL=
 COHERE_API_KEY=
@@ -391,6 +403,17 @@ One bounded telemetry service captures HTTP events, RAG attempt events, errors, 
 detailed request traces. Its sink is a small protocol; MongoDB is the only implementation today.
 Writes are batched off the response path, queued traces remain readable in-process, and shutdown
 drains the queue within `telemetry.shutdown_timeout_seconds` before the external clients close.
+
+Persistence stays best effort, bounded and off the response path. Traces are written before
+routine events, and a trace that needs the last free queue slot evicts the newest waiting event.
+Each trace is an insert-only upsert keyed by tenant and request ID, so a batch that failed
+part-way through on a transient store error is retried once with the same records; a stored
+trace that differs from the retried one is reported as a conflict and left unchanged. Permanent
+failures are not retried. Shutdown spends one `telemetry.shutdown_timeout_seconds` budget on
+draining, the retry and cancellation, and refuses new traces once it begins. Dropped events and
+traces, retries, failed batches and traces abandoned at shutdown are logged with their request
+IDs and counted in the service's `delivery_counts`. A trace can still be lost if the process
+dies or the store stays unavailable past the retry.
 
 Trace text follows `telemetry.content_mode`. `redacted` (the default) stores lengths and
 HMAC-SHA256 digests keyed by `TELEMETRY_HASH_KEY`, `metadata_only` stores lengths only, and `full`

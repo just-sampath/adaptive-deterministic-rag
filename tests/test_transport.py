@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Callable, Mapping
@@ -9,6 +10,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from starlette.types import Message, Receive, Scope, Send
 
 from handlers.contracts import (
     QueryHandler,
@@ -191,6 +193,19 @@ def make_identity(
     return Identity(tenant_id="tenant-a", user_id=user_id, roles=roles)
 
 
+def test_historical_selected_verdict_carries_unknown_handler_outcome() -> None:
+    record = make_trace(REQUEST_ID).model_dump(
+        exclude={"handler_outcome", "returned_status", "returned_document_ids"}
+    )
+    record.update(final_status="COMPLETE", final_source_ids=["selected-chunk"])
+    legacy = RequestTrace.model_validate(record)
+    assert legacy.handler_outcome == "unknown"
+    assert legacy.returned_status is None and legacy.returned_document_ids is None
+    assert legacy.final_status is ResultStatus.COMPLETE and legacy.final_source_ids == (
+        "selected-chunk",
+    )
+
+
 def test_search_passes_trusted_identity_and_records_completion(
     make_settings: Callable[..., Settings],
 ) -> None:
@@ -212,6 +227,53 @@ def test_search_passes_trusted_identity_and_records_completion(
     assert completed[0].user_id == "user-a"
     assert completed[0].attributes["path"] == "/v1/rag/query"
     assert completed[0].attributes["status_code"] == 200
+    assert completed[0].attributes["response_completed"] is True
+
+
+@pytest.mark.parametrize("break_at", ["start", "body", "cancel", "omit_final", "none"])
+async def test_transport_event_observes_only_acknowledged_sends(
+    make_settings: Callable[..., Settings], break_at: str
+) -> None:
+    context = make_context(make_settings())
+    app = make_app(context)
+    scope: Scope = {"type": "http", "app": app, "method": "GET", "path": "/stream"}
+    attempts: list[str] = []
+
+    async def stream(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 206})
+        await send({"type": "http.response.body", "body": b"part", "more_body": True})
+        if break_at != "omit_final":
+            await send({"type": "http.response.body", "body": b"end"})
+
+    async def send(message: Message) -> None:
+        attempts.append(message["type"])
+        if break_at == "cancel" and message.get("body") == b"end":
+            raise asyncio.CancelledError
+        if (break_at == "start" and message["type"] == "http.response.start") or (
+            break_at == "body" and message.get("body") == b"end"
+        ):
+            raise BrokenPipeError("client closed the connection")
+
+    async def receive() -> Message:
+        return {"type": "http.disconnect"}
+
+    exchange = RequestTelemetryMiddleware(stream)(scope, receive, send)
+    if break_at in {"start", "body"}:
+        with pytest.raises(BrokenPipeError):
+            await exchange
+    elif break_at == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await exchange
+    else:
+        await exchange
+    (event,) = context.telemetry.named("http.request.completed")
+    assert event.request_id == scope["state"]["request_id"]
+    assert event.attributes["status_code"] == (None if break_at == "start" else 206)
+    assert event.attributes["response_started"] is (break_at != "start")
+    assert event.attributes["response_completed"] is (break_at == "none")
+    if break_at == "cancel":
+        assert event.attributes["error_code"] == "CancelledError"
+    assert attempts.count("http.response.start") == 1
 
 
 @pytest.mark.parametrize(

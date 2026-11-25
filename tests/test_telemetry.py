@@ -24,10 +24,16 @@ from models.domain import (
     AttributionStatus,
     CitationAssessment,
     ContextualizationTrace,
+    HandlerOutcome,
     ModelUsage,
+    OperationStatus,
+    ProviderOperation,
     RequestTrace,
+    ResultStatus,
+    RetrievalStrategy,
     RewriteDecision,
     TelemetryEvent,
+    UsageCoverage,
 )
 from routes.dependencies import RequestIdentity
 from services.telemetry import TelemetryService
@@ -119,9 +125,11 @@ async def test_mongo_trace_layout_and_read_after_disabling_writes(enriched: bool
             write_query_intent_fields=True,
         )
 
+    collection.bulk_write.return_value.upserted_ids = {0: "mongo-id"}
     await writer.write_traces([rejected_rewrite_trace()])
 
-    document = BSON(BSON.encode(collection.insert_many.await_args.args[0][0])).decode()
+    update = collection.bulk_write.await_args.args[0][0]
+    document = BSON(BSON.encode(update._doc["$setOnInsert"])).decode()
     expected = {
         "enabled": True,
         "detector": "model",
@@ -165,6 +173,117 @@ async def test_pending_trace_exposes_the_configured_query_intent_fields(
     assert pending.contextualization.proposed_drift_score == (0.25 if enriched else None)
     assert pending.contextualization.rewrite_decision == ("rejected_anchor" if enriched else None)
     assert await service.get_trace("rewrite", "tenant") == pending
+
+
+_LEGACY_TRACE_KEYS = {
+    "request_id",
+    "tenant_id",
+    "user_id",
+    "literal_question_observation",
+    "canonical_question_observation",
+    "attempted_strategies",
+    "generation_repair_used",
+    "attempts",
+    "final_status",
+    "final_source_ids",
+    "latency_ms",
+    "token_usage",
+    "model_calls",
+    "prompt_versions",
+    "runtime_versions",
+    "configuration_fingerprint",
+    "error_code",
+    "contextualization",
+    "degraded",
+    "created_at",
+}
+_ACCOUNTING_KEYS = {
+    "operations",
+    "usage_coverage",
+    "handler_outcome",
+    "returned_status",
+    "returned_document_ids",
+}
+
+
+def accounted_trace() -> RequestTrace:
+    operation = ProviderOperation(
+        slot=1,
+        operation="generation",
+        strategy=RetrievalStrategy.HAPPY_PATH,
+        strategy_try=1,
+        repair_ordinal=0,
+        status=OperationStatus.COMPLETED,
+        provider="openai",
+        model="generator",
+        request_id="call-1",
+        usage=ModelUsage(input_tokens=3, output_tokens=2, total_tokens=5),
+    )
+    return make_trace("accounted").model_copy(
+        update={
+            "operations": (operation,),
+            "usage_coverage": UsageCoverage.COMPLETE,
+            "handler_outcome": HandlerOutcome.RETURNED,
+            "returned_status": ResultStatus.COMPLETE,
+            "returned_document_ids": ("doc-a",),
+            "final_status": ResultStatus.COMPLETE,
+        }
+    )
+
+
+@pytest.mark.parametrize("enriched", [False, True], ids=["legacy", "enriched"])
+async def test_accounting_fields_are_written_only_when_enabled_and_old_rows_still_read(
+    enriched: bool,
+) -> None:
+    collection = create_autospec(AsyncCollection, instance=True)
+    database = cast(AsyncDatabase[dict[str, Any]], {"traces": collection, "events": None})
+    sink = MongoTelemetrySink(
+        database,
+        trace_collection="traces",
+        event_collection="events",
+        write_accounting_fields=enriched,
+    )
+    collection.bulk_write.return_value.upserted_ids = {0: "mongo-id"}
+
+    await sink.write_traces([accounted_trace()])
+
+    update = collection.bulk_write.await_args.args[0][0]
+    document = BSON(BSON.encode(update._doc["$setOnInsert"])).decode()
+    assert set(document) == (
+        _LEGACY_TRACE_KEYS | _ACCOUNTING_KEYS if enriched else _LEGACY_TRACE_KEYS
+    )
+    collection.find_one.return_value = document
+    stored = await sink.get_trace("accounted", "tenant")
+    assert stored is not None
+    assert stored.handler_outcome is (
+        HandlerOutcome.RETURNED if enriched else HandlerOutcome.UNKNOWN
+    )
+    assert stored.usage_coverage is (UsageCoverage.COMPLETE if enriched else UsageCoverage.UNKNOWN)
+    assert stored.returned_document_ids == (("doc-a",) if enriched else None)
+    assert stored.final_status is ResultStatus.COMPLETE
+
+
+@pytest.mark.parametrize("enriched", [False, True], ids=["legacy", "enriched"])
+async def test_pending_trace_reads_like_the_stored_accounting_layout(enriched: bool) -> None:
+    service = TelemetryService(
+        FakeRepository(),
+        TelemetryConfig(content_mode=ContentMode.FULL, write_accounting_fields=enriched),
+        hash_key=_HASH_KEY,
+    )
+    await service.start()
+    try:
+        await service.save_trace(accounted_trace())
+        pending = await service.get_trace("accounted", "tenant")
+    finally:
+        await service.close()
+
+    assert pending is not None
+    assert (pending.operations is not None) is enriched
+    assert pending.handler_outcome is (
+        HandlerOutcome.RETURNED if enriched else HandlerOutcome.UNKNOWN
+    )
+    assert pending.returned_status is (ResultStatus.COMPLETE if enriched else None)
+    assert pending.final_status is ResultStatus.COMPLETE
 
 
 def log_field(record: logging.LogRecord, name: str) -> object:
@@ -549,9 +668,11 @@ async def test_attempt_outcome_layout_and_reads(outcome: AttemptOutcome | None) 
     sink = MongoTelemetrySink(database, trace_collection="traces", event_collection="events")
     trace = make_trace("attempt").model_copy(update={"attempts": (_attempt_with(outcome),)})
 
+    collection.bulk_write.return_value.upserted_ids = {0: "mongo-id"}
     await sink.write_traces([trace])
 
-    document = BSON(BSON.encode(collection.insert_many.await_args.args[0][0])).decode()
+    update = collection.bulk_write.await_args.args[0][0]
+    document = BSON(BSON.encode(update._doc["$setOnInsert"])).decode()
     stored = document["attempts"][0]
     if outcome is None:
         # A writer with verification disabled emits exactly the previous attempt layout.

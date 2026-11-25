@@ -43,6 +43,7 @@ from utils.prompts import (
     generation_user_prompt,
     repair_user_prompt,
 )
+from utils.request_context import observed_call
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,12 +86,16 @@ class GenerationService:
         conversation_facts: Sequence[str],
     ) -> GenerationResult:
         async with asyncio.timeout(self._timeout_seconds):
-            result = await self._model.complete(
-                model=self._model_name,
-                system_prompt=GENERATOR_SYSTEM,
-                user_prompt=generation_user_prompt(query, context, conversation_facts),
-                output_type=GenerationDraft,
-                max_output_tokens=self._max_output_tokens,
+            result = await observed_call(
+                "generation",
+                self._model_name,
+                self._model.complete(
+                    model=self._model_name,
+                    system_prompt=GENERATOR_SYSTEM,
+                    user_prompt=generation_user_prompt(query, context, conversation_facts),
+                    output_type=GenerationDraft,
+                    max_output_tokens=self._max_output_tokens,
+                ),
             )
         return _generation(result, "generation")
 
@@ -105,22 +110,26 @@ class GenerationService:
     ) -> GenerationResult:
         attributed = isinstance(faithfulness, AttributedFaithfulness)
         async with asyncio.timeout(self._timeout_seconds):
-            result = await self._model.complete(
-                model=self._model_name,
-                system_prompt=ATTRIBUTION_REPAIR_SYSTEM if attributed else REPAIR_SYSTEM,
-                user_prompt=repair_user_prompt(
-                    query=query,
-                    previous_answer=previous_answer,
-                    context=context,
-                    faithfulness=faithfulness,
-                    completeness=completeness,
-                    # The judged draft fit the table limit, so its occurrence IDs resolve here.
-                    previous_occurrences=citation_occurrences(previous_answer)
-                    if attributed
-                    else None,
+            result = await observed_call(
+                "repair",
+                self._model_name,
+                self._model.complete(
+                    model=self._model_name,
+                    system_prompt=ATTRIBUTION_REPAIR_SYSTEM if attributed else REPAIR_SYSTEM,
+                    user_prompt=repair_user_prompt(
+                        query=query,
+                        previous_answer=previous_answer,
+                        context=context,
+                        faithfulness=faithfulness,
+                        completeness=completeness,
+                        # The judged draft fit the table limit, so its occurrence IDs resolve here.
+                        previous_occurrences=citation_occurrences(previous_answer)
+                        if attributed
+                        else None,
+                    ),
+                    output_type=GenerationDraft,
+                    max_output_tokens=self._max_output_tokens,
                 ),
-                output_type=GenerationDraft,
-                max_output_tokens=self._max_output_tokens,
             )
         return _generation(result, "repair")
 
@@ -152,13 +161,17 @@ class OnlineEvaluator:
         prompt = evaluation_user_prompt(query, answer, context)
         faithful_result, complete_result = await run_pair(
             self._judge(
+                "faithfulness_evaluation",
                 ATTRIBUTION_SYSTEM,
                 evaluation_user_prompt(query, answer, context, occurrences),
                 AttributedFaithfulness,
             )
             if occurrences is not None
-            else self._judge(FAITHFULNESS_SYSTEM, prompt, FaithfulnessEvaluation),
+            else self._judge(
+                "faithfulness_evaluation", FAITHFULNESS_SYSTEM, prompt, FaithfulnessEvaluation
+            ),
             self._judge(
+                "completeness_evaluation",
                 REQUIREMENTS_SYSTEM if occurrences is not None else COMPLETENESS_SYSTEM,
                 prompt,
                 CompletenessEvaluation,
@@ -184,17 +197,22 @@ class OnlineEvaluator:
 
     async def _judge[SchemaT: BaseModel](
         self,
+        stage: str,
         system_prompt: str,
         user_prompt: str,
         output_type: type[SchemaT],
     ) -> ModelResult[SchemaT]:
         async with asyncio.timeout(self._timeout_seconds):
-            return await self._model.complete(
-                model=self._model_name,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                output_type=output_type,
-                max_output_tokens=self._max_output_tokens,
+            return await observed_call(
+                stage,
+                self._model_name,
+                self._model.complete(
+                    model=self._model_name,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    output_type=output_type,
+                    max_output_tokens=self._max_output_tokens,
+                ),
             )
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from time import perf_counter
 from uuid import uuid4
 
@@ -23,8 +23,8 @@ from models.domain import (
     EvidenceRef,
     FaithfulnessEvaluation,
     FaithfulnessStatus,
+    HandlerOutcome,
     Identity,
-    ModelCallTrace,
     ModelUsage,
     QueryMetadata,
     QueryRequest,
@@ -60,7 +60,7 @@ from services.telemetry import TelemetryService
 from services.understanding import QueryUnderstandingService
 from utils.errors import InfrastructureError, RequestDeadlineExceededError
 from utils.prompts import PROMPT_VERSIONS, STANDARD_ABSTENTION, VERIFICATION_PROMPT_VERSIONS
-from utils.request_context import current_request_id
+from utils.request_context import collect_operations, current_operations, current_request_id
 from utils.settings import ContextualizationConfig, PolicyConfig, RetrievalConfig, TimeoutConfig
 
 _DEADLINE_CODE = "REQUEST_DEADLINE_EXCEEDED"
@@ -75,11 +75,11 @@ class _RequestRecord:
     literal_observation: dict[str, str | int]
     canonical_observation: dict[str, str | int]
     contextualization: ContextualizationTrace | None = None
-    contextualization_usage: ModelUsage = field(default_factory=ModelUsage)
-    contextualization_calls: tuple[ModelCallTrace, ...] = ()
     history_refs: tuple[EvidenceRef, ...] = ()
     state: RagState | None = None
     terminal: TerminalResult | None = None
+    response: QueryResponse | None = None
+    handler_outcome: HandlerOutcome = HandlerOutcome.FAILED
     error_code: str | None = None
 
 
@@ -157,16 +157,21 @@ class SearchHandler:
             canonical_observation=observation,
         )
         self._emit(record.request_id, identity, "rag.request.started")
-        outcome: _Outcome | None = None
-        try:
-            outcome = await self._run(record, request, start)
-        except Exception as exc:
-            record.error_code = _error_code(exc)
-            raise
-        finally:
-            await self._save_trace(record, started)
-        assert outcome is not None
-        return self._response(record, outcome, started)
+        with collect_operations():
+            try:
+                outcome = await self._run(record, request, start)
+                record.response = self._response(record, outcome, started)
+                record.handler_outcome = HandlerOutcome.RETURNED
+                return record.response
+            except asyncio.CancelledError as exc:
+                record.handler_outcome = HandlerOutcome.CANCELLED
+                record.error_code = type(exc).__name__
+                raise
+            except Exception as exc:
+                record.error_code = _error_code(exc)
+                raise
+            finally:
+                await self._save_trace(record, started)
 
     async def _run(self, record: _RequestRecord, request: QueryRequest, start: float) -> _Outcome:
         deadline = asyncio.timeout_at(start + self._timeouts.request_seconds)
@@ -255,8 +260,6 @@ class SearchHandler:
         history, record.history_refs = await self._history(record.identity, request)
         understood = await self._query_understanding.understand(request.message, history)
         record.contextualization = understood.trace
-        record.contextualization_usage = understood.usage
-        record.contextualization_calls = understood.model_calls
         record.canonical_observation = self._telemetry.observe_text(
             understood.query.canonical_question
         )
@@ -330,6 +333,11 @@ class SearchHandler:
         while True:
             plan = self._strategies.get(strategy)
             state.attempted_strategies.append(strategy)
+            collector = current_operations()
+            if collector is not None:
+                collector.strategy = strategy
+                collector.strategy_try = len(state.attempted_strategies)
+                collector.repair_ordinal = 0
             self._emit(
                 state.request_id,
                 state.identity,
@@ -429,6 +437,9 @@ class SearchHandler:
     ) -> TerminalResult | EvaluationResult | AttemptOutcome:
         started = perf_counter()
         state.generation_repairs_used += 1
+        collector = current_operations()
+        if collector is not None:
+            collector.repair_ordinal = state.generation_repairs_used
         packed = evidence.context.packed_context
         repaired = await self._generator.repair(
             query=state.query,
@@ -657,9 +668,9 @@ class SearchHandler:
         state = record.state
         attempts = tuple(state.attempts) if state else ()
         terminal = record.terminal
-        token_usage = record.contextualization_usage + sum(
-            (attempt.token_usage for attempt in attempts), ModelUsage()
-        )
+        collector = current_operations()
+        assert collector is not None
+        token_usage, coverage, calls = collector.summary()
         trace = RequestTrace(
             request_id=record.request_id,
             tenant_id=record.identity.tenant_id,
@@ -671,10 +682,18 @@ class SearchHandler:
             attempts=attempts,
             final_status=terminal.status if terminal else None,
             final_source_ids=terminal.verified_chunk_ids if terminal else (),
+            handler_outcome=record.handler_outcome,
+            returned_status=record.response.status if record.response else None,
+            returned_document_ids=(
+                tuple(source.document_id for source in record.response.sources)
+                if record.response
+                else None
+            ),
             latency_ms=latency_ms,
             token_usage=token_usage,
-            model_calls=record.contextualization_calls
-            + tuple(call for attempt in attempts for call in attempt.model_calls),
+            model_calls=calls,
+            operations=collector.snapshot(),
+            usage_coverage=coverage,
             prompt_versions=VERIFICATION_PROMPT_VERSIONS
             if self._policy.verify_answers
             else PROMPT_VERSIONS,

@@ -31,6 +31,7 @@ from utils.errors import (
     ProviderError,
     ProviderResponseError,
 )
+from utils.request_context import collect_operations, observed_call
 
 _Handler2 = Callable[[httpx2.Request], httpx2.Response]
 _Handler = Callable[[httpx.Request], httpx.Response]
@@ -230,3 +231,29 @@ async def test_other_mongo_failures_stay_service_errors(error: PyMongoError) -> 
         await _mongo_call(error)
 
     assert not isinstance(caught.value, TimeoutError)
+
+
+def _cohere_metered(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "id": "rerank-1",
+            "results": [{"index": 0, "relevance_score": 0.9}],
+            "meta": {"billed_units": {"search_units": 1}},
+        },
+        request=request,
+    )
+
+
+async def test_cohere_records_its_request_id_and_billed_units_but_no_tokens() -> None:
+    with collect_operations() as collector:
+        ranked = await observed_call("rerank", "rerank-test", _rerank(_cohere_metered))
+
+    assert len(ranked) == 1  # type: ignore[arg-type]
+    (row,) = collector.snapshot()
+    assert row.provider == "cohere"
+    assert row.request_id == "rerank-1"
+    assert row.rerank_metering is not None
+    assert row.rerank_metering.billed_units == {"search_units": 1.0}
+    # Search units are a billing unit, never tokens.
+    assert row.usage is None

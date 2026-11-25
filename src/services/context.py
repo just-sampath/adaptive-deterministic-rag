@@ -10,6 +10,7 @@ from functools import cache
 
 from models.domain import Chunk, Identity, PackedContext, RankedChunk
 from services.contracts import DocumentReader, PassageTokenCounter, Reranker
+from utils.request_context import observed_call
 from utils.settings import ContextConfig
 
 _MID_LIST = re.compile(r"^\s*(?:[2-9]|\d{2,})[.)]\s")
@@ -238,7 +239,15 @@ class ContextBuilder:
         filters: Mapping[str, str | int | float | bool] | None = None,
     ) -> ContextOutcome:
         async with asyncio.timeout(self._reranking_timeout_seconds):
-            reranked = await self._reranker.rerank(query, candidates, len(candidates))
+            reranked = (
+                await observed_call(
+                    "rerank",
+                    self._reranker.version,
+                    self._reranker.rerank(query, candidates, len(candidates)),
+                )
+                if candidates
+                else []
+            )
         seeds = reranked[: self._generation_k]
         completed = await self._completer.complete(seeds, identity, filters=filters)
         return ContextOutcome(

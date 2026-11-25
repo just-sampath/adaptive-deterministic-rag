@@ -16,10 +16,14 @@ from models.domain import (
     FaithfulnessEvaluation,
     FollowupClassification,
     GenerationDraft,
+    ModelUsage,
+    OperationStatus,
     QueryRecoveryOutput,
+    UsageCoverage,
 )
 from providers.openai import OpenAITextModel, structured_output_format
 from utils.errors import ProviderResponseError
+from utils.request_context import collect_operations, observed_call
 
 # Every schema the application asks OpenAI to fill.
 _OUTPUT_TYPES: tuple[type[BaseModel], ...] = (
@@ -237,3 +241,37 @@ async def test_incomplete_reply_reports_its_reason() -> None:
 
     with pytest.raises(ProviderResponseError, match="max_output_tokens"):
         await _complete(model)
+
+
+async def test_a_reply_that_fails_to_parse_still_records_its_reported_usage() -> None:
+    reply = _reply('{"answer": ')
+    reply.usage = SimpleNamespace(
+        input_tokens=7,
+        output_tokens=3,
+        total_tokens=10,
+        input_tokens_details=None,
+        output_tokens_details=None,
+    )
+    reply._request_id = "req-parse"
+    model, _ = _model(reply)
+
+    with collect_operations() as collector, pytest.raises(ProviderResponseError):
+        await observed_call("generation", "gpt-test", _complete(model))
+
+    (row,) = collector.snapshot()
+    assert row.status is OperationStatus.FAILED
+    assert row.request_id == "req-parse"
+    assert row.usage == ModelUsage(input_tokens=7, output_tokens=3, total_tokens=10)
+    assert collector.summary()[1] is UsageCoverage.COMPLETE
+
+
+async def test_a_reply_without_usage_is_unknown_rather_than_zero() -> None:
+    model, _ = _model(_reply('{"answer": "Yes [E1]."}'))
+
+    with collect_operations() as collector:
+        await observed_call("generation", "gpt-test", _complete(model))
+
+    (row,) = collector.snapshot()
+    assert row.status is OperationStatus.COMPLETED
+    assert row.usage is None
+    assert collector.summary()[1] is UsageCoverage.UNKNOWN

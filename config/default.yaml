@@ -113,6 +113,7 @@ timeouts:
 telemetry:
   enabled: true
   write_query_intent_fields: false
+  write_accounting_fields: false
   content_mode: redacted
   queue_capacity: 2000
   batch_size: 100

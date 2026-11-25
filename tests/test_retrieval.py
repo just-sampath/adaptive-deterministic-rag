@@ -5,13 +5,16 @@ import asyncio
 import pytest
 
 from models.domain import (
+    EmbeddingResult,
     EncodedQuery,
     HybridHits,
     Identity,
+    OperationStatus,
     QueryRecoveryOutput,
     QueryUnderstanding,
     RetrievalPlan,
     SearchHit,
+    UsageCoverage,
 )
 from providers.sparse import Bm25SparseEncoder
 from services.encoding import EmbeddingCache, HybridQueryEncoder
@@ -29,6 +32,8 @@ from tests.fakes import (
     StalledTextModel,
     make_chunk,
 )
+from utils.errors import ProviderError
+from utils.request_context import collect_operations
 from utils.settings import FusionStrategy, RetrievalConfig, SparseConfig
 
 _CHUNK_ID = "00000000-0000-0000-0000-000000000001"
@@ -494,3 +499,57 @@ async def test_filter_hydrated_seeds_before_candidate_limit(identity: Identity) 
     )
     assert [r.chunk.id for r in outcome.ranked_chunks] == ["second"]
     assert outcome.metadata_mismatch_count == 1
+
+
+async def test_partially_successful_variants_keep_the_usage_of_returned_embeddings(
+    identity: Identity,
+) -> None:
+    returned = asyncio.Event()
+
+    class OneVariantFails(FakeEmbeddings):
+        async def embed_query(self, text: str) -> EmbeddingResult:
+            if text == "keywords":
+                await returned.wait()
+                raise ProviderError("embedding unavailable")
+            result = await super().embed_query(text)
+            if self.query_calls == 3:
+                asyncio.get_running_loop().call_soon(returned.set)
+            return result
+
+    model = FakeTextModel()
+    model.queue(
+        QueryRecoveryOutput,
+        QueryRecoveryOutput(keyword_query="keywords", decomposed_queries=("first",)),
+    )
+    hybrid = HybridRetriever(
+        encoder=HybridQueryEncoder(
+            dense=OneVariantFails(),
+            sparse=Bm25SparseEncoder(SparseConfig()),
+            cache=EmbeddingCache(max_entries=0),
+            embedding_timeout_seconds=1,
+        ),
+        vector_store=FakeVectorSearch(),
+        repository=FakeRepository(),
+        config=RetrievalConfig(),
+        retrieval_timeout_seconds=1,
+    )
+    retriever = StrategyRetriever(
+        hybrid=hybrid, query_recovery=_recovery(model), config=RetrievalConfig()
+    )
+
+    with collect_operations() as collector, pytest.raises(ProviderError):
+        await retriever.retrieve(
+            plan=RetrievalPlan(dense_k=5, sparse_k=0, candidate_k=5, recover_queries=True),
+            query=_query(),
+            identity=identity,
+            filters={},
+        )
+
+    rows = collector.snapshot()
+    completed = {row.request_id for row in rows if row.status is OperationStatus.COMPLETED}
+    assert completed == {"fake-request", "embedding-1", "embedding-2", "embedding-3"}
+    (failed,) = [row for row in rows if row.status is OperationStatus.FAILED]
+    assert failed.operation == "embedding" and failed.usage is None
+    total, coverage, _ = collector.summary()
+    assert total.total_tokens == 15 + 3 * 2
+    assert coverage is UsageCoverage.PARTIAL

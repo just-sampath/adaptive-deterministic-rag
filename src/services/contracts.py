@@ -97,6 +97,8 @@ class VectorSearch(Protocol):
 
 
 class Reranker(Protocol):
+    """Ranking-only consumers use the list; RerankResult also carries native response metering."""
+
     @property
     def version(self) -> str: ...
 

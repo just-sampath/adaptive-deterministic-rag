@@ -22,3 +22,21 @@ and score these dimensions independently:
 Do not tune and report on the same set. Keep development and held-out suites separate and rerun them
 whenever prompts, models, retrieval budgets, fusion, context packing, or provider configuration
 changes.
+
+## Counting handler and HTTP outcomes
+
+Join each trace to the `http.request.completed` event with the same `request_id`. The trace's
+`final_status` is the selected internal verdict. `final_source_ids` contains its verified chunk
+IDs. A later evidence check can withdraw that answer, and a store failure can prevent a response.
+
+- Count returned answers by `returned_status` when `handler_outcome` is `returned`. Compare
+  `returned_document_ids` with the question's expected documents. A returned abstention has an
+  empty list. Failed and cancelled handlers have no returned status or document list.
+- For observed HTTP completions, require both `response_started` and `response_completed`.
+  Group by the event's `status_code`. Start and completion each record a successful ASGI
+  send. They establish server handoff. A started 200 with an interrupted body is an interrupted
+  exchange. A completed 503 is a completed error response.
+- Keep separate counts for interrupted exchanges, missing transport events, and historical
+  records whose outcome fields are absent. Missing traces and events are possible because
+  persistence is best effort. Count each side of an unmatched join independently. A client-side
+  observation is needed to establish receipt.

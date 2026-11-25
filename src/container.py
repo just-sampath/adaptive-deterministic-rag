@@ -160,9 +160,11 @@ def _compose(
             trace_collection=settings.mongodb.trace_collection,
             event_collection=settings.mongodb.telemetry_collection,
             write_query_intent_fields=settings.telemetry.write_query_intent_fields,
+            write_accounting_fields=settings.telemetry.write_accounting_fields,
         ),
         settings.telemetry,
         hash_key=settings.external.telemetry_hash_key.get_secret_value().encode(),
+        store_timeout_seconds=settings.mongodb.operation_timeout_ms / 1000,
     )
     vector_manager = QdrantVectorManager(
         clients.qdrant,

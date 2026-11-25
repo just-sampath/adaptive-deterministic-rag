@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable
 from time import perf_counter
 from typing import Protocol, cast
@@ -37,23 +38,30 @@ class RequestTelemetryMiddleware:
         scope.setdefault("state", {})["request_id"] = request_id
         tokens = bind_request(request_id)
         started = perf_counter()
-        status_code = 500
+        status_code: int | None = None
         error_code: str | None = None
-        response_started = False
+        start_attempted = False
+        response_completed = False
 
         async def send_with_request_id(message: Message) -> None:
-            nonlocal status_code, response_started
+            nonlocal status_code, start_attempted, response_completed
             if message["type"] == "http.response.start":
-                response_started = True
-                status_code = message["status"]
+                start_attempted = True
                 message["headers"] = _with_request_id(message.get("headers", ()), request_id)
             await send(message)
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            elif message["type"] == "http.response.body" and not message.get("more_body", False):
+                response_completed = True
 
         try:
             await self._app(scope, receive, send_with_request_id)
+        except asyncio.CancelledError as exc:
+            error_code = type(exc).__name__
+            raise
         except Exception as exc:
             error_code = type(exc).__name__
-            if response_started:
+            if start_attempted:
                 raise
             # Answer here rather than re-raising: Starlette's outer error middleware re-raises
             # after responding, and the server would then log the failure a second time with its
@@ -72,6 +80,8 @@ class RequestTelemetryMiddleware:
                     "method": scope.get("method", ""),
                     "path": _route_template(scope),
                     "status_code": status_code,
+                    "response_started": status_code is not None,
+                    "response_completed": response_completed,
                     "latency_ms": round((perf_counter() - started) * 1000, 3),
                     "error_code": error_code,
                 },

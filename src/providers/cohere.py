@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import math
+import sys
 from collections.abc import Sequence
 from typing import Any
 
 import httpx
 
-from models.domain import RankedChunk
+from models.domain import RankedChunk, RerankMetering, RerankResult
 from utils.errors import OperationTimeoutError, ProviderError, ProviderResponseError
+from utils.request_context import observe_response, operation
 
 
 class CohereReranker:
@@ -39,67 +41,121 @@ class CohereReranker:
         query: str,
         chunks: Sequence[RankedChunk],
         top_n: int,
-    ) -> list[RankedChunk]:
+    ) -> RerankResult:
         if not chunks:
-            return []
-        try:
-            response = await self._client.post(
-                "/v2/rerank",
-                json={
-                    "model": self._model,
-                    "query": query,
-                    "documents": [item.chunk.text for item in chunks],
-                    "top_n": min(top_n, len(chunks)),
-                },
-            )
-            response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise OperationTimeoutError("Cohere reranking call timed out") from exc
-        except httpx.HTTPError as exc:
-            raise ProviderError("Cohere reranking call failed") from exc
-        try:
-            payload: Any = response.json()
-        except ValueError as exc:
-            raise ProviderResponseError("Cohere returned invalid JSON") from exc
-        if not isinstance(payload, dict):
-            msg = "Cohere rerank response must be an object"
-            raise ProviderResponseError(msg)
-        results = payload.get("results")
-        if not isinstance(results, list):
-            msg = "Cohere rerank response omitted results"
-            raise ProviderResponseError(msg)
-
-        reranked: list[RankedChunk] = []
-        seen: set[int] = set()
-        for rank, result in enumerate(results, start=1):
-            if not isinstance(result, dict):
-                msg = "Cohere rerank result must be an object"
-                raise ProviderResponseError(msg)
-            index = result.get("index")
-            score = result.get("relevance_score")
-            if (
-                not isinstance(index, int)
-                or isinstance(index, bool)
-                or not 0 <= index < len(chunks)
-                or index in seen
-            ):
-                msg = "Cohere returned an invalid or duplicate document index"
-                raise ProviderResponseError(msg)
-            if (
-                not isinstance(score, int | float)
-                or isinstance(score, bool)
-                or not math.isfinite(score)
-                or not 0 <= score <= 1
-            ):
-                msg = "Cohere returned an invalid relevance score"
-                raise ProviderResponseError(msg)
-            seen.add(index)
-            reranked.append(
-                chunks[index].model_copy(
-                    update={"reranker_score": float(score), "reranker_rank": rank}
+            return RerankResult([], request_id=None, metering=None)
+        with operation("rerank", self._model, provider="cohere", adapter=True):
+            try:
+                response = await self._client.post(
+                    "/v2/rerank",
+                    json={
+                        "model": self._model,
+                        "query": query,
+                        "documents": [item.chunk.text for item in chunks],
+                        "top_n": min(top_n, len(chunks)),
+                    },
                 )
+                response.raise_for_status()
+            except httpx.TimeoutException as exc:
+                raise OperationTimeoutError("Cohere reranking call timed out") from exc
+            except httpx.HTTPError as exc:
+                raise ProviderError("Cohere reranking call failed") from exc
+            try:
+                payload: Any = response.json()
+            except ValueError as exc:
+                raise ProviderResponseError("Cohere returned invalid JSON") from exc
+            if not isinstance(payload, dict):
+                msg = "Cohere rerank response must be an object"
+                raise ProviderResponseError(msg)
+            request_id = payload.get("id") if isinstance(payload.get("id"), str) else None
+            metering = _metering(payload.get("meta"))
+            usage = metering.token_usage() if metering else None
+            observe_response(
+                provider="cohere",
+                model=self._model,
+                request_id=request_id,
+                usage=usage,
+                metering=metering,
             )
-        return reranked
+            results = payload.get("results")
+            if not isinstance(results, list):
+                msg = "Cohere rerank response omitted results"
+                raise ProviderResponseError(msg)
+
+            reranked: list[RankedChunk] = []
+            seen: set[int] = set()
+            for rank, result in enumerate(results, start=1):
+                if not isinstance(result, dict):
+                    msg = "Cohere rerank result must be an object"
+                    raise ProviderResponseError(msg)
+                index = result.get("index")
+                score = result.get("relevance_score")
+                if (
+                    not isinstance(index, int)
+                    or isinstance(index, bool)
+                    or not 0 <= index < len(chunks)
+                    or index in seen
+                ):
+                    msg = "Cohere returned an invalid or duplicate document index"
+                    raise ProviderResponseError(msg)
+                if (
+                    not isinstance(score, int | float)
+                    or isinstance(score, bool)
+                    or not math.isfinite(score)
+                    or not 0 <= score <= 1
+                ):
+                    msg = "Cohere returned an invalid relevance score"
+                    raise ProviderResponseError(msg)
+                seen.add(index)
+                reranked.append(
+                    chunks[index].model_copy(
+                        update={"reranker_score": float(score), "reranker_rank": rank}
+                    )
+                )
+            return RerankResult(reranked, request_id=request_id, metering=metering)
 
     async def close(self) -> None:
         await self._client.aclose()
+
+
+def _metering(meta: object) -> RerankMetering | None:
+    if not isinstance(meta, dict):
+        return None
+    billed = meta.get("billed_units")
+    tokens = meta.get("tokens")
+    units = {}
+    if isinstance(billed, dict):
+        for name in (
+            "search_units",
+            "input_tokens",
+            "output_tokens",
+            "image_tokens",
+            "text_tokens",
+            "images",
+            "classifications",
+            "pages",
+        ):
+            value = _counter(billed.get(name))
+            if value is not None:
+                units[name] = value
+    input_tokens = _counter(tokens.get("input_tokens")) if isinstance(tokens, dict) else None
+    output_tokens = _counter(tokens.get("output_tokens")) if isinstance(tokens, dict) else None
+    cached = _counter(meta.get("cached_tokens"))
+    if not units and input_tokens is None and output_tokens is None and cached is None:
+        return None
+    return RerankMetering(
+        billed_units=units,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_tokens=cached,
+    )
+
+
+def _counter(value: object) -> float | None:
+    if (
+        isinstance(value, (float, int))
+        and not isinstance(value, bool)
+        and 0 <= value <= sys.float_info.max
+    ):
+        return float(value)
+    return None

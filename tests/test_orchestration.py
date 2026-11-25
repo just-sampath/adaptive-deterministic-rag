@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -30,6 +31,7 @@ from models.domain import (
     GenerationDraft,
     HybridHits,
     Identity,
+    ModelUsage,
     QueryRecoveryOutput,
     QueryRequest,
     RagFailure,
@@ -144,7 +146,10 @@ def _telemetry(repository: FakeRepository) -> TelemetryService:
     return TelemetryService(
         repository,
         TelemetryConfig(
-            enabled=True, content_mode=ContentMode.METADATA_ONLY, write_query_intent_fields=True
+            enabled=True,
+            content_mode=ContentMode.METADATA_ONLY,
+            write_query_intent_fields=True,
+            write_accounting_fields=True,
         ),
         hash_key=b"test-telemetry-key",
     )
@@ -156,7 +161,9 @@ class _RecordingTelemetry(TelemetryService):
     def __init__(self, repository: FakeRepository) -> None:
         super().__init__(
             repository,
-            TelemetryConfig(enabled=True, content_mode=ContentMode.METADATA_ONLY),
+            TelemetryConfig(
+                enabled=True, content_mode=ContentMode.METADATA_ONLY, write_accounting_fields=True
+            ),
             hash_key=b"test-telemetry-key",
         )
         self.emitted: list[tuple[str, dict[str, object]]] = []
@@ -167,6 +174,144 @@ class _RecordingTelemetry(TelemetryService):
 
     def named(self, event_type: str) -> list[dict[str, object]]:
         return [attributes for name, attributes in self.emitted if name == event_type]
+
+
+@pytest.mark.parametrize("returned", [FaithfulnessEvaluation, CompletenessEvaluation])
+async def test_interrupted_judges_preserve_returned_calls(
+    identity: Identity, returned: type
+) -> None:
+    finished = asyncio.Event()
+
+    class InterruptedJudges(FakeTextModel):
+        async def complete(self, **kwargs: Any) -> Any:
+            schema = kwargs["output_type"]
+            if (
+                schema in (FaithfulnessEvaluation, CompletenessEvaluation)
+                and schema is not returned
+            ):
+                await finished.wait()
+                raise ProviderError("judge unavailable")
+            result = await super().complete(**kwargs)
+            if schema is returned:
+                asyncio.get_running_loop().call_soon(finished.set)
+            return replace(result, request_id=schema.__name__)
+
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = InterruptedJudges()
+    queue_complete_answer(model, "Answer [E1].")
+    handler = build_orchestrator(model=model, repository=repository, vector_store=hit_store())
+    with pytest.raises(ProviderError):
+        await handler.query(identity, QueryRequest(message="What is supported?"))
+    (trace,) = repository.traces.values()
+    assert trace.attempted_strategies == (HAPPY,) and not trace.attempts
+    assert trace.token_usage.total_tokens == 2 + 15 + 15
+    assert {item.request_id for item in trace.model_calls} == {
+        "embedding-1",
+        "GenerationDraft",
+        returned.__name__,
+    }
+    assert trace.usage_coverage == "partial"
+    assert trace.operations is not None
+    assert [item.slot for item in trace.operations] == list(range(1, len(trace.operations) + 1))
+    assert all(item.strategy == HAPPY and item.strategy_try == 1 for item in trace.operations)
+    assert sum(item.status == "failed" and item.usage is None for item in trace.operations) == 1
+
+
+async def test_judge_cancelled_before_its_reply_has_unknown_usage(identity: Identity) -> None:
+    class CancelledJudge(FakeTextModel):
+        async def complete(self, **kwargs: Any) -> Any:
+            if kwargs["output_type"] is FaithfulnessEvaluation:
+                await asyncio.Event().wait()  # cancelled by the failing sibling
+            if kwargs["output_type"] is CompletenessEvaluation:
+                raise ProviderError("judge unavailable")
+            return await super().complete(**kwargs)
+
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = CancelledJudge()
+    queue_complete_answer(model, "Answer [E1].")
+    handler = build_orchestrator(model=model, repository=repository, vector_store=hit_store())
+
+    with pytest.raises(ProviderError):
+        await handler.query(identity, QueryRequest(message="What is supported?"))
+
+    (trace,) = repository.traces.values()
+    assert trace.operations is not None
+    judges = {item.operation: item for item in trace.operations if "evaluation" in item.operation}
+    assert judges["faithfulness_evaluation"].status == "cancelled"
+    assert judges["faithfulness_evaluation"].usage is None
+    assert judges["completeness_evaluation"].status == "failed"
+    assert trace.token_usage.total_tokens == 2 + 15
+    assert trace.usage_coverage == "partial"
+
+
+async def test_repair_calls_carry_their_ordinal_and_totals_match_the_attempts(
+    identity: Identity,
+) -> None:
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    model.queue(
+        GenerationDraft,
+        GenerationDraft(answer="Advantages only [E1]."),
+        GenerationDraft(answer="Advantages and limitations [E1]."),
+    )
+    model.queue(FaithfulnessEvaluation, _supported(), _supported())
+    missing = CompletenessEvaluation(
+        passed=False,
+        failure_type=CompletenessStatus.MISSING_ANSWER_CONTENT,
+        requirements=(
+            RequirementEvaluation(
+                requirement="limitations",
+                status=RequirementStatus.MISSING,
+                available_in_context=True,
+                supporting_chunks=("E1",),
+            ),
+        ),
+        missing_information_available=True,
+        confidence=1,
+    )
+    model.queue(CompletenessEvaluation, missing, _complete_evaluation())
+    handler = build_orchestrator(model=model, repository=repository, vector_store=hit_store())
+
+    response = await handler.query(identity, QueryRequest(message="Explain the feature"))
+
+    trace = repository.traces[response.request_id]
+    assert trace.operations is not None
+    stages = [(item.operation, item.repair_ordinal) for item in trace.operations]
+    assert stages == [
+        ("embedding", 0),
+        ("rerank", 0),
+        ("generation", 0),
+        ("faithfulness_evaluation", 0),
+        ("completeness_evaluation", 0),
+        ("repair", 1),
+        ("faithfulness_evaluation", 1),
+        ("completeness_evaluation", 1),
+    ]
+    # The fake reranker reports no usage, so the request total is only partly observed.
+    assert trace.usage_coverage == "partial"
+    assert trace.token_usage.total_tokens == 2 + 6 * 15
+    assert trace.token_usage == sum(
+        (attempt.token_usage for attempt in trace.attempts), ModelUsage()
+    )
+
+
+async def test_concurrent_requests_keep_separate_operation_records(identity: Identity) -> None:
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    queue_complete_answer(model, "First [E1].")
+    queue_complete_answer(model, "Second [E1].")
+    handler = build_orchestrator(model=model, repository=repository, vector_store=hit_store())
+
+    responses = await asyncio.gather(
+        handler.query(identity, QueryRequest(message="First question")),
+        handler.query(identity, QueryRequest(message="Second question")),
+    )
+
+    for response in responses:
+        trace = repository.traces[response.request_id]
+        assert trace.operations is not None
+        assert [item.slot for item in trace.operations] == [1, 2, 3, 4, 5]
+        assert trace.token_usage.total_tokens == 2 + 3 * 15
 
 
 def build_orchestrator(
@@ -1013,6 +1158,9 @@ async def test_partial_answer_after_exhausting_strategies_discloses_unanswered_r
     assert trace.final_status is ResultStatus.VERIFIED_PARTIAL
     assert trace.degraded is False
     assert trace.error_code is None
+    assert trace.handler_outcome == "returned"
+    assert trace.returned_status is ResultStatus.VERIFIED_PARTIAL
+    assert trace.returned_document_ids == tuple(source.document_id for source in response.sources)
 
 
 async def test_deadline_salvages_best_verified_answer_and_keeps_the_retry_decision(
@@ -1690,20 +1838,92 @@ async def test_failed_repair_is_evaluated_and_its_attempt_carries_the_retry_deci
     assert RagFailure.GENERATION_HALLUCINATION in last.failure_types
 
 
-async def test_trace_keeps_complete_terminal_when_sources_fail_after_it(identity: Identity) -> None:
+@pytest.mark.parametrize("drop_events", [False, True], ids=["transport-event", "events-dropped"])
+def test_trace_keeps_complete_terminal_when_sources_fail_after_it(
+    make_settings: Callable[..., Settings], monkeypatch: pytest.MonkeyPatch, drop_events: bool
+) -> None:
     repository = _SourcesUnavailableRepository((make_chunk(CHUNK_ID),))
     model = FakeTextModel()
     queue_complete_answer(model, "Advantages [E1].")
     orchestrator = build_orchestrator(model=model, repository=repository, vector_store=hit_store())
 
-    with pytest.raises(ProviderError):
-        await orchestrator.query(identity, QueryRequest(message="Explain the feature"))
-
-    trace = next(iter(repository.traces.values()))
+    context = make_context(make_settings(), repository=repository, query=orchestrator)
+    if drop_events:
+        monkeypatch.setattr(context.telemetry, "emit", lambda *args, **kwargs: None)
+    with TestClient(make_app(context)) as client:
+        response = client.post(
+            "/v1/rag/query", headers=TRUSTED_HEADERS, json={"message": "Explain the feature"}
+        )
+    assert response.status_code == 503
+    trace = repository.traces[response.headers["x-request-id"]]
+    events = context.telemetry.named("http.request.completed")
+    if drop_events:
+        assert not events
+    else:
+        (event,) = events
+        assert event.request_id == trace.request_id
+        assert event.attributes["status_code"] == 503
+        assert event.attributes["response_completed"] is True
     assert trace.final_status is ResultStatus.COMPLETE
     assert trace.final_source_ids == (CHUNK_ID,)
+    assert trace.handler_outcome == "failed"
+    assert trace.returned_status is None
+    assert trace.returned_document_ids is None
     assert trace.degraded is False
     assert trace.error_code == "ProviderError"
+
+
+async def test_trace_records_cancelled_history_write(identity: Identity) -> None:
+    writing = asyncio.Event()
+
+    class PausedHistory(FakeRepository):
+        async def append_messages(
+            self, identity: Identity, conversation_id: str, messages: Sequence[ConversationMessage]
+        ) -> None:
+            writing.set()
+            await asyncio.Event().wait()
+
+    repository = PausedHistory((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    queue_complete_answer(model, "Advantages [E1].")
+    handler = build_orchestrator(model=model, repository=repository, vector_store=hit_store())
+    task = asyncio.create_task(
+        handler.query(
+            identity, QueryRequest(message="Explain the feature", conversation_id="guide")
+        )
+    )
+    try:
+        await asyncio.wait_for(writing.wait(), timeout=2)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    (trace,) = repository.traces.values()
+    assert trace.handler_outcome == "cancelled"
+    assert trace.final_status is ResultStatus.COMPLETE
+    assert trace.returned_status is None and trace.returned_document_ids is None
+    assert trace.error_code == "CancelledError"
+
+
+async def test_response_construction_failure_is_in_the_saved_trace(
+    identity: Identity, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    queue_complete_answer(model, "Advantages [E1].")
+    handler = build_orchestrator(model=model, repository=repository, vector_store=hit_store())
+
+    def fail_response(*args: object) -> None:
+        raise ValueError("invalid response")
+
+    monkeypatch.setattr(handler, "_response", fail_response)
+    with pytest.raises(ValueError, match="invalid response"):
+        await handler.query(identity, QueryRequest(message="Explain the feature"))
+    (trace,) = repository.traces.values()
+    assert trace.final_status is ResultStatus.COMPLETE
+    assert trace.handler_outcome == "failed"
+    assert trace.returned_status is None and trace.returned_document_ids is None
+    assert trace.error_code == "ValueError"
 
 
 async def test_trace_keeps_salvaged_partial_as_degraded_when_sources_fail(
@@ -1844,6 +2064,9 @@ async def test_final_evidence_uses_every_packed_passage(identity: Identity, chan
     assert trace.final_status is ResultStatus.COMPLETE
     _assert_answer_targets(model, request.message, "Which handbook applies to the new edition?")
     assert trace.final_source_ids == cited
+    assert trace.handler_outcome == "returned"
+    assert trace.returned_status is response.status
+    assert trace.returned_document_ids == tuple(source.document_id for source in response.sources)
     assert response.metadata.generation_repaired is (change == "repaired")
     assert len(_generation_payloads(model)) == (2 if change == "repaired" else 1)
     assert repository.hydrate_calls == [(first.id, sibling.id), (first.id, sibling.id)]

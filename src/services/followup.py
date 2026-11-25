@@ -14,6 +14,7 @@ from models.domain import (
 )
 from services.contracts import TextModel
 from utils.prompts import FOLLOWUP_DETECTOR_SYSTEM, followup_detection_user_prompt, history_line
+from utils.request_context import observed_call
 
 _FOLLOWUP_REFERENCE = re.compile(
     r"\b(?:it|its|that|this|they|them|those|these|former|latter|above|previous)\b",
@@ -129,12 +130,16 @@ class ModelFollowupDetector:
         history: Sequence[ConversationMessage],
     ) -> FollowupDecision:
         history_lines = [history_line(message.role, message.content) for message in history]
-        result = await self._model.complete(
-            model=self._model_name,
-            system_prompt=FOLLOWUP_DETECTOR_SYSTEM,
-            user_prompt=followup_detection_user_prompt(question, history_lines),
-            output_type=FollowupClassification,
-            max_output_tokens=self._max_output_tokens,
+        result = await observed_call(
+            "followup_detection",
+            self._model_name,
+            self._model.complete(
+                model=self._model_name,
+                system_prompt=FOLLOWUP_DETECTOR_SYSTEM,
+                user_prompt=followup_detection_user_prompt(question, history_lines),
+                output_type=FollowupClassification,
+                max_output_tokens=self._max_output_tokens,
+            ),
         )
         return FollowupDecision(
             detector=self.name,
