@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import importlib
+import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from typing import Any
 
 import pytest
 from openai._utils import _logs
+from pydantic import ValidationError
 
 from models.domain import (
     AttemptOutcome,
@@ -17,6 +21,7 @@ from models.domain import (
     ContradictedClaim,
     FaithfulnessEvaluation,
     FaithfulnessStatus,
+    GenerationDraft,
     ModelUsage,
     RequestTrace,
     RequirementEvaluation,
@@ -28,7 +33,9 @@ from models.domain import (
 )
 from services.telemetry import TelemetryService
 from tests.fakes import FakeRepository
-from utils.logging import configure_logging
+from utils.concurrency import run_all
+from utils.errors import InfrastructureError, ProviderError, ProviderResponseError
+from utils.logging import JsonFormatter, configure_logging
 from utils.settings import ContentMode, TelemetryConfig
 
 _HASH_KEY = b"test-telemetry-key"
@@ -296,3 +303,128 @@ def test_projection_keeps_an_unevaluated_attempt_without_verdicts(mode: ContentM
     assert projected.faithfulness is None and projected.completeness is None
     if mode is not ContentMode.FULL:
         assert "secret" not in projected.model_dump_json()
+
+
+_SENTINEL = "sentinel-rejected-text"
+
+
+def _formatted_log(error: BaseException) -> tuple[dict[str, Any], str]:
+    record = logging.LogRecord(
+        "test", logging.ERROR, __file__, 1, "Request failed", None, _exc_info(error)
+    )
+    record.request_id = "request-1"
+    record.tenant_id = "tenant-a"
+    record.error_code = type(error).__name__
+    rendered = JsonFormatter().format(record)
+    return json.loads(rendered), rendered
+
+
+def _exc_info(error: BaseException) -> tuple[type[BaseException], BaseException, Any]:
+    return type(error), error, error.__traceback__
+
+
+def _raised(action: Callable[[], object]) -> BaseException:
+    try:
+        action()
+    except Exception as error:  # noqa: BLE001 - each case raises a different type on purpose
+        return error
+    raise AssertionError("expected an exception")
+
+
+def _invalid_draft() -> object:
+    return GenerationDraft.model_validate_json('{"answer": "' + _SENTINEL)
+
+
+def _wrapped_record() -> object:
+    try:
+        _invalid_draft()
+    except ValidationError as error:
+        raise ProviderResponseError("MongoDB returned an invalid record") from error
+    return None
+
+
+def _implicit_context() -> object:
+    try:
+        raise ValueError(_SENTINEL)
+    except ValueError:
+        raise InfrastructureError("MongoDB operation failed")  # noqa: B904
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_types"),
+    [
+        pytest.param(lambda: _raise(RuntimeError(_SENTINEL)), ["RuntimeError"], id="ordinary"),
+        pytest.param(_invalid_draft, ["pydantic_core._pydantic_core.ValidationError"], id="direct"),
+        pytest.param(
+            _wrapped_record,
+            ["utils.errors.ProviderResponseError", "Caused by:", "ValidationError"],
+            id="wrapper",
+        ),
+        pytest.param(
+            _implicit_context,
+            ["utils.errors.InfrastructureError", "Raised while handling:", "ValueError"],
+            id="implicit-context",
+        ),
+    ],
+)
+def test_formatted_exception_keeps_types_and_frames_but_no_message(
+    action: Callable[[], object], expected_types: list[str]
+) -> None:
+    payload, rendered = _formatted_log(_raised(action))
+
+    assert _SENTINEL not in rendered
+    assert payload["message"] == "Request failed"
+    assert payload["request_id"] == "request-1"
+    assert payload["tenant_id"] == "tenant-a"
+    assert "test_redaction.py" in payload["exception"]
+    for expected in expected_types:
+        assert expected in payload["exception"]
+
+
+async def test_formatted_task_group_failure_lists_members_without_messages() -> None:
+    async def fails() -> None:
+        raise ValueError(_SENTINEL)
+
+    async def wrapped() -> None:
+        try:
+            await run_all([fails(), asyncio.sleep(0)])
+        except ValueError as error:
+            raise ProviderError("Provider call failed") from error
+
+    with pytest.raises(ProviderError) as caught:
+        await wrapped()
+
+    payload, rendered = _formatted_log(caught.value)
+
+    assert _SENTINEL not in rendered
+    assert "ExceptionGroup" in payload["exception"]
+    assert "Group member 1 of 1:" in payload["exception"]
+    assert "(repeated)" in payload["exception"]
+
+
+def test_formatted_exception_group_omits_its_own_message() -> None:
+    group = ExceptionGroup(_SENTINEL, [ValueError(_SENTINEL), KeyError(_SENTINEL)])
+
+    payload, rendered = _formatted_log(group)
+
+    assert _SENTINEL not in rendered
+    assert "Group member 2 of 2:" in payload["exception"]
+
+
+def test_formatted_exception_stays_bounded_for_a_very_deep_cause_chain() -> None:
+    # An unbounded walk would overflow the stack, and logging would then print the raw chain.
+    error: BaseException = ValueError(_SENTINEL)
+    for _ in range(3000):
+        wrapper = RuntimeError(_SENTINEL)
+        wrapper.__cause__ = error
+        error = wrapper
+
+    payload, rendered = _formatted_log(error)
+
+    assert _SENTINEL not in rendered
+    assert "(further exceptions omitted)" in payload["exception"]
+    assert len(rendered) < 10_000
+
+
+def _raise(error: BaseException) -> object:
+    raise error

@@ -8,7 +8,6 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
 
 from models.domain import Identity
 from routes.dependencies import get_route_context
@@ -86,9 +85,11 @@ def _record_failure(request: Request, exc: Exception) -> None:
     identity = _identity(request)
     tenant_id = identity.tenant_id if identity else None
     error_code = type(exc).__name__
+    # The JSON formatter writes exception types and frame locations only, never messages, so
+    # validation errors and wrappers around them are safe to attach.
     logger.error(
         "Request failed",
-        exc_info=None if _embeds_input(exc) else (type(exc), exc, exc.__traceback__),
+        exc_info=(type(exc), exc, exc.__traceback__),
         extra={"request_id": request_id, "tenant_id": tenant_id, "error_code": error_code},
     )
     get_route_context(request).telemetry.emit(
@@ -98,12 +99,6 @@ def _record_failure(request: Request, exc: Exception) -> None:
         user_id=identity.user_id if identity else None,
         attributes={"error_code": error_code},
     )
-
-
-def _embeds_input(exc: Exception) -> bool:
-    """Validation messages quote rejected input or model output, so they are logged by type only."""
-
-    return isinstance(exc, ValidationError | RequestValidationError)
 
 
 def _request_id(request: Request) -> str | None:

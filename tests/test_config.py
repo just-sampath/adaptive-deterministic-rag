@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path
@@ -20,9 +23,11 @@ from utils.settings import (
     TimeoutConfig,
     VectorStoreConfig,
     load_settings,
+    mongodb_transport,
 )
 
-_PROJECT_CONFIG = Path(__file__).resolve().parents[1] / "config"
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_CONFIG = _PROJECT_ROOT / "config"
 
 
 def test_local_yaml_overlays_stable_defaults(tmp_path: Path) -> None:
@@ -287,6 +292,11 @@ def test_production_rejects_plain_http_endpoints_that_receive_api_keys(
         "mongodb://appuser:secret@db.internal:27017/adaptive_rag",
         "mongodb://appuser:secret@db.internal:27017/adaptive_rag?tls=false",
         "mongodb://appuser@db.internal:27017/adaptive_rag",
+        # An explicit opt-out wins over the SRV default, in either spelling and any case.
+        "mongodb+srv://appuser:secret@cluster.example.com/adaptive_rag?tls=false",
+        "mongodb+srv://appuser:secret@cluster.example.com/adaptive_rag?SSL=false",
+        # A mechanism that sends a credential needs TLS even without user information.
+        "mongodb://db.internal:27017/?authMechanism=MONGODB-OIDC",
     ],
 )
 def test_production_rejects_mongodb_credentials_without_tls(uri: str) -> None:
@@ -298,14 +308,146 @@ def test_production_rejects_mongodb_credentials_without_tls(uri: str) -> None:
     "uri",
     [
         "mongodb+srv://appuser:secret@cluster.example.com/adaptive_rag",
+        "mongodb+srv://appuser:secret@cluster.example.com/adaptive_rag?tls=true&appName=rag",
         "mongodb://appuser:secret@db.example.com:27017/adaptive_rag?tls=true",
         "mongodb://appuser:secret@db.example.com:27017/adaptive_rag?SSL=true",
+        "mongodb://appuser:secret@db.example.com:27017/adaptive_rag?tls=true&ssl=true",
+        "mongodb://appuser:secret@db1.example.com,db2.example.com/?tls=true;replicaSet=rs0",
     ],
 )
 def test_production_accepts_mongodb_credentials_only_over_tls(uri: str) -> None:
     settings = _production(mongodb_uri=uri)
 
     assert settings.external.mongodb_uri.get_secret_value() == uri
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "tls=true&TLS=false",  # a repeated option the driver would silently resolve
+        "tls=true&tls=true",
+        "tls=true&ssl=false",  # the driver rejects conflicting aliases
+        "tls=maybe",  # the driver would warn and drop it, falling back to its default
+        "TLS=TRUE",  # option names are case-insensitive, but boolean values are not
+        "tls",
+        "unknownOption=1",
+        "tls=true&appName=a;replicaSet=b",
+        "tls=true&tlsCRLFile=a.pem&tlsCRLFile=b.pem",
+    ],
+)
+def test_mongodb_uri_rejects_ambiguous_or_invalid_options_without_echoing_them(
+    query: str,
+) -> None:
+    uri = f"mongodb://sentinel-user:sentinel-pass@db.example.com/?{query}"
+
+    with pytest.raises(ValidationError) as caught:
+        ExternalSettings(_env_file=None, mongodb_uri=uri)
+
+    rendered = str(caught.value) + repr(caught.value)
+    assert "invalid, repeated or conflicting connection options" in rendered
+    assert "sentinel" not in rendered
+    assert query not in rendered
+
+
+def test_unreadable_mongodb_tls_file_is_a_safe_settings_error(tmp_path: Path) -> None:
+    # The driver's validator opens the file and raises an OSError that names the path.
+    missing = tmp_path / "sentinel-ca.pem"
+    uri = f"mongodb://sentinel-user:sentinel-pass@db.example.com/?tls=true&tlsCAFile={missing}"
+
+    with pytest.raises(ValidationError) as caught:
+        ExternalSettings(_env_file=None, mongodb_uri=uri)
+
+    rendered = str(caught.value) + repr(caught.value)
+    assert "invalid, repeated or conflicting connection options" in rendered
+    assert "sentinel" not in rendered
+
+
+def test_mongodb_option_check_runs_in_every_environment() -> None:
+    with pytest.raises(ValidationError, match="conflicting connection options"):
+        ExternalSettings(
+            _env_file=None, app_env=Environment.LOCAL, mongodb_uri="mongodb://h/?tls=yes&tls=no"
+        )
+
+
+def test_transport_rejection_does_not_echo_the_credentialed_uri() -> None:
+    uri = "mongodb://sentinel-user:sentinel-pass@db.internal:27017/adaptive_rag?tls=false"
+
+    with pytest.raises(ValidationError) as caught:
+        _production(mongodb_uri=uri)
+
+    assert "sentinel" not in str(caught.value)
+
+
+def test_invalid_mongodb_scheme_does_not_echo_the_uri() -> None:
+    with pytest.raises(ValidationError) as caught:
+        ExternalSettings(_env_file=None, mongodb_uri="http://sentinel-user:sentinel-pass@db/")
+
+    assert "must use mongodb:// or mongodb+srv://" in str(caught.value)
+    assert "sentinel" not in str(caught.value)
+
+
+def test_production_loader_applies_the_transport_rule(tmp_path: Path) -> None:
+    (tmp_path / "default.yaml").write_text("ai:\n  provider: fake\nreranker:\n  provider: fake\n")
+    external = ExternalSettings(
+        _env_file=None,
+        app_env=Environment.PRODUCTION,
+        config_dir=tmp_path,
+        auth_shared_token=_AUTH_TOKEN,
+        debug_token=_DEBUG_TOKEN,
+        telemetry_hash_key=_TELEMETRY_KEY,
+        mongodb_uri="mongodb+srv://appuser:secret@cluster.example.com/?ssl=false",
+    )
+
+    with pytest.raises(ValidationError, match="must use TLS in production"):
+        load_settings(external)
+
+
+def test_startup_failure_on_stderr_omits_the_mongodb_credential(tmp_path: Path) -> None:
+    """Settings fail before logging is configured, so check the interpreter's own output."""
+
+    environment = {
+        **{key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        "PYTHONPATH": str(_PROJECT_ROOT / "src"),
+        "APP_ENV": "production",
+        "CONFIG_DIR": str(_PROJECT_CONFIG),
+        "OPENAI_API_KEY": "sk-placeholder",
+        "COHERE_API_KEY": "co-placeholder",
+        "AUTH_SHARED_TOKEN": _AUTH_TOKEN,
+        "DEBUG_TOKEN": _DEBUG_TOKEN,
+        "TELEMETRY_HASH_KEY": _TELEMETRY_KEY,
+    }
+    for uri in (
+        "mongodb://sentinel-user:sentinel-pass@db.internal/?tls=false",
+        "mongodb://sentinel-user:sentinel-pass@db.internal/?tls=sentinel-value",
+    ):
+        completed = subprocess.run(
+            [sys.executable, "-c", "from utils.settings import load_settings; load_settings()"],
+            cwd=tmp_path,
+            env={**environment, "MONGODB_URI": uri},
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        assert completed.returncode != 0
+        assert "ValidationError" in completed.stderr
+        assert "sentinel" not in completed.stderr
+
+
+@pytest.mark.parametrize(("query", "encrypted"), [("", False), ("?tls=true", True)])
+async def test_mongo_client_takes_its_transport_from_the_validated_uri(
+    query: str, encrypted: bool
+) -> None:
+    """Validation reads TLS from the URI alone, so the builder must not override it."""
+
+    uri = f"mongodb://localhost:27017/{query}"
+    client = build_mongo_client(uri=uri, server_selection_timeout_ms=100, operation_timeout_ms=100)
+    try:
+        assert mongodb_transport(uri).encrypted is encrypted
+        assert (client.options.pool_options._ssl_context is not None) is encrypted
+    finally:
+        await client.close()
 
 
 def test_production_allows_an_uncredentialed_mongodb_uri() -> None:

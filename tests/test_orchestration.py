@@ -64,7 +64,7 @@ from tests.fakes import (
     make_chunk,
 )
 from tests.test_transport import TRUSTED_HEADERS, make_app, make_context
-from utils.errors import ProviderError, RequestDeadlineExceededError
+from utils.errors import OperationTimeoutError, ProviderError, RequestDeadlineExceededError
 from utils.prompts import STANDARD_ABSTENTION
 from utils.settings import (
     ContentMode,
@@ -1141,6 +1141,77 @@ async def test_provider_timeout_is_not_mislabeled_as_global_deadline(
 
     trace = next(iter(repository.traces.values()))
     assert trace.error_code == "TimeoutError"
+
+
+async def _transport_time_out() -> None:
+    raise OperationTimeoutError("Qdrant operation timed out")
+
+
+async def test_adapter_timeout_without_an_answer_is_an_operation_timeout_not_a_deadline(
+    identity: Identity,
+) -> None:
+    repository = FakeRepository()
+    orchestrator = build_orchestrator(
+        model=FakeTextModel(),
+        repository=repository,
+        vector_store=scripted_store(fail_from=1, action=_transport_time_out),
+    )
+
+    with pytest.raises(OperationTimeoutError):
+        await orchestrator.query(identity, QueryRequest(message="Question"))
+
+    trace = next(iter(repository.traces.values()))
+    assert trace.error_code == "OperationTimeoutError"
+    assert trace.final_status is None
+
+
+async def test_adapter_timeout_after_a_verified_answer_is_salvaged_like_a_stage_timeout(
+    identity: Identity,
+) -> None:
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    model.queue(QueryRecoveryOutput, QueryRecoveryOutput())
+    queue_partial_rounds(model, rounds=1)
+    orchestrator = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=scripted_store(fail_from=2, action=_transport_time_out),
+    )
+
+    response = await orchestrator.query(identity, QueryRequest(message="Explain the feature"))
+
+    assert response.status is ResultStatus.VERIFIED_PARTIAL
+    assert response.metadata.degraded is True
+    trace = repository.traces[response.request_id]
+    assert trace.error_code == "OperationTimeoutError"
+    assert trace.degraded is True
+
+
+class _FinalReadTimesOutRepository(FakeRepository):
+    """Authorized retrieval works, but the final evidence read times out at the adapter."""
+
+    async def hydrate_authorized_chunks(
+        self, chunk_ids: Sequence[str], identity: Identity
+    ) -> dict[str, Chunk]:
+        if self.hydrate_calls:
+            raise OperationTimeoutError("MongoDB operation timed out")
+        return await super().hydrate_authorized_chunks(chunk_ids, identity)
+
+
+async def test_adapter_timeout_in_the_final_evidence_read_prevents_delivery(
+    identity: Identity,
+) -> None:
+    repository = _FinalReadTimesOutRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    queue_complete_answer(model, "Advantages and limitations [E1].")
+    orchestrator = build_orchestrator(model=model, repository=repository, vector_store=hit_store())
+
+    with pytest.raises(OperationTimeoutError):
+        await orchestrator.query(identity, QueryRequest(message="Explain the feature"))
+
+    trace = next(iter(repository.traces.values()))
+    assert trace.final_status is ResultStatus.COMPLETE
+    assert trace.error_code == "OperationTimeoutError"
 
 
 @pytest.mark.parametrize("inline", [True, False])

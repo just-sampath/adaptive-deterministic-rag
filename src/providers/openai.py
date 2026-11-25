@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, TypeVar, cast
 
-from openai import AsyncOpenAI, Omit, OpenAIError, omit
+from openai import APITimeoutError, AsyncOpenAI, Omit, OpenAIError, omit
 from openai.lib._pydantic import to_strict_json_schema
 from openai.types.responses import ResponseFormatTextJSONSchemaConfigParam
 from openai.types.shared import ReasoningEffort
@@ -13,7 +13,7 @@ from openai.types.shared_params import Reasoning
 from pydantic import BaseModel, ValidationError
 
 from models.domain import EmbeddingResult, ModelResult, ModelUsage
-from utils.errors import ProviderError, ProviderResponseError
+from utils.errors import OperationTimeoutError, ProviderError, ProviderResponseError
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 _EMBEDDING_BATCH_SIZE = 256
@@ -71,6 +71,8 @@ class OpenAITextModel:
                 store=False,
                 reasoning=self._reasoning(model),
             )
+        except APITimeoutError as exc:
+            raise OperationTimeoutError("OpenAI structured model call timed out") from exc
         except OpenAIError as exc:
             raise ProviderError("OpenAI structured model call failed") from exc
         if response.status == "incomplete":
@@ -177,6 +179,8 @@ class OpenAIEmbeddingProvider:
                 dimensions=self._dimension,
                 encoding_format="float",
             )
+        except APITimeoutError as exc:
+            raise OperationTimeoutError("OpenAI embedding call timed out") from exc
         except OpenAIError as exc:
             raise ProviderError("OpenAI embedding call failed") from exc
         ordered = sorted(response.data, key=lambda item: item.index)

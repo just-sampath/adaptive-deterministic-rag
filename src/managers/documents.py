@@ -67,8 +67,8 @@ class MongoDocumentManager:
         ]
         try:
             current_documents = [_CurrentDocument.model_validate(item) for item in raw_documents]
-        except ValidationError as exc:
-            raise ProviderResponseError("MongoDB returned an invalid document record") from exc
+        except ValidationError:
+            raise ProviderResponseError("MongoDB returned an invalid document record") from None
         current_versions = {item.id: item.current_version_id for item in current_documents}
         return {
             chunk.id: chunk

@@ -81,6 +81,15 @@ best verified answer found so far goes through final evidence checks before it c
 Without one, the error is raised unchanged. A nested provider timeout remains an operation timeout;
 only an expired request or attempt deadline is reported as `REQUEST_DEADLINE_EXCEEDED`.
 
+Each adapter translates its own client's timeout at its boundary, before the broad SDK error
+handler: OpenAI's `APITimeoutError`, an HTTPX `TimeoutException` from Cohere, a Qdrant
+`ResponseHandlingException` whose `source` is an HTTPX timeout, and a PyMongo error whose
+`timeout` is true. It raises `OperationTimeoutError`, a `TimeoutError` that is not an
+`InfrastructureError`, so the handler salvages it like a stage timeout and the route answers 504
+`OPERATION_TIMEOUT`. Every other provider or store failure stays an `InfrastructureError` (503).
+Readiness turns a dependency timeout back into `InfrastructureError`, so `/health/ready` reports
+503.
+
 ## Startup initialization
 
 Settings validation accepts `context.tokenizer_encoding: o200k_base` only when
@@ -330,10 +339,12 @@ capacity. After shutdown begins, traces are written directly under a short timeo
 a bounded time for the writer to flush, then cancels it. Queue saturation, sink failures, and
 server-side request failures (deadline, timeout, provider, unexpected) produce structured stderr
 logs with request IDs, and those failures also emit `http.request.failed`; client errors appear in
-`http.request.completed` with their status code. Validation failures are logged by type only, so
-rejected input is not echoed. The request middleware answers an unexpected error itself instead of
-re-raising it to the server, so the failure is logged once; an error raised after the response has
-started is still re-raised and also logged by uvicorn. In a single uvicorn process, uvicorn's
+`http.request.completed` with their status code. The JSON formatter writes a logged exception as
+the types and frame locations of its cause chain and task-group members, never their messages, so
+rejected input and provider replies are not echoed even through a wrapper. The request middleware
+answers an unexpected error itself instead of re-raising it to the server, so the failure is
+logged once; an error raised after the response has started is still re-raised and also logged by
+uvicorn. In a single uvicorn process, uvicorn's
 startup and access logs go through the same JSON handler; the supervisor that `--reload` or
 `--workers` starts logs its own lines in uvicorn's plain-text format. Access logs carry the client
 address and the request path with its query string. SDK loggers that can print payloads are held at `WARNING`. There is

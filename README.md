@@ -142,8 +142,15 @@ rejects the placeholder `AUTH_SHARED_TOKEN`, `DEBUG_TOKEN`, and `TELEMETRY_HASH_
 rejects any of the three that is shorter than 32 characters or equal to another of the three.
 Production also requires `https://` for each endpoint that receives a credential: `OPENAI_BASE_URL`
 when `OPENAI_API_KEY` is set, `COHERE_BASE_URL` when `COHERE_API_KEY` is set, and `QDRANT_URL` when
-`QDRANT_API_KEY` is set. A `MONGODB_URI` that carries a username or password must use
-`mongodb+srv://` or request TLS with `tls=true` (or `ssl=true`).
+`QDRANT_API_KEY` is set. A `MONGODB_URI` that carries a username or password, or names an
+`authMechanism`, must use TLS. The check reads the URI the way PyMongo does: option names are
+case-insensitive, `ssl` is an alias of `tls`, values must be lowercase `true` or `false`, and a
+`mongodb+srv://` URI uses TLS unless it sets `tls=false` or `ssl=false`. Other TLS options, such
+as `tlsCAFile`, don't count as a request for TLS here, so set `tls=true` with them. No hostname is
+resolved.
+In every environment, startup rejects a URI whose options are invalid or conflicting, or that
+repeats a TLS or authentication option, where the driver would warn and then drop or override a
+value. Configuration errors name the setting but never print the URI or another secret.
 
 The complete environment surface is:
 
@@ -359,6 +366,13 @@ If a passage is missing, loses eligibility, or changes its model-visible content
 the API returns `INSUFFICIENT_EVIDENCE` with the literal question as unanswered and empty sources
 and citations. A conversation turn stores the abstention, and a `rag.evidence.withdrawn` event
 records the reason and the status that was selected. A final store failure remains an error.
+
+A failed request returns a JSON `error` code. `REQUEST_DEADLINE_EXCEEDED` (504) means the request
+or attempt deadline expired with no verified answer to return. `OPERATION_TIMEOUT` (504) means a
+stage timer expired, or an upstream client's own timeout did: an OpenAI or Cohere call, a Qdrant
+request, or a MongoDB operation, including server selection. Any other provider or store failure
+is `SERVICE_UNAVAILABLE` (503). `GET /health/ready` reports a failed or timed-out dependency as
+503.
 Partial answers end with a verification disclosure that lists the unanswered requirements.
 `metadata.degraded` is true when a stage timeout or infrastructure failure was salvaged into a
 verified partial answer.
@@ -381,9 +395,11 @@ drains the queue within `telemetry.shutdown_timeout_seconds` before the external
 Trace text follows `telemetry.content_mode`. `redacted` (the default) stores lengths and
 HMAC-SHA256 digests keyed by `TELEMETRY_HASH_KEY`, `metadata_only` stores lengths only, and `full`
 stores text. Application logs are structured JSON on stderr, and an unexpected error is logged once
-unless it happens after the response has started. In a single uvicorn process, uvicorn's startup
-and access logs are JSON too; the supervisor that `--reload` or `--workers` starts logs in plain
-text. Access logs include the client address and the request path with its query string. Queue
+unless it happens after the response has started. A logged exception shows the exception types and
+frame locations of its whole cause chain and of any task-group members, never their messages,
+source lines or locals, since a message can quote a rejected record or a provider reply. In a
+single uvicorn process, uvicorn's startup and access logs are JSON too; the supervisor that
+`--reload` or `--workers` starts logs in plain text. Access logs include the client address and the request path with its query string. Queue
 saturation and sink failures are logged there
 with the affected request IDs. OpenTelemetry is not used.
 

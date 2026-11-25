@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -7,6 +8,7 @@ from dataclasses import dataclass
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from handlers.contracts import (
     QueryHandler,
@@ -30,7 +32,15 @@ from models.domain import (
 from routes.exceptions import register_exception_handlers
 from routes.index import build_router
 from tests.fakes import FakeRepository
-from utils.errors import InfrastructureError, NotFoundError, RequestDeadlineExceededError
+from utils.errors import (
+    InfrastructureError,
+    NotFoundError,
+    OperationTimeoutError,
+    ProviderError,
+    ProviderResponseError,
+    RequestDeadlineExceededError,
+)
+from utils.logging import JsonFormatter
 from utils.settings import Settings
 
 REQUEST_ID = "5b1d3c6e-2f4a-4e8b-9c7d-0a1b2c3d4e5f"
@@ -282,24 +292,54 @@ def test_unhandled_error_is_answered_and_logged_once_without_reaching_the_server
     assert len(failures) == 1
 
 
-def test_validation_failure_is_logged_by_type_without_the_model_text(
+def _parse_draft() -> None:
+    GenerationDraft.model_validate_json('{"answer": "Acme bills 4')
+
+
+def _wrapped_draft() -> None:
+    try:
+        _parse_draft()
+    except ValidationError as error:
+        raise ProviderResponseError("MongoDB returned an invalid record") from error
+
+
+@pytest.mark.parametrize(
+    ("failure", "status", "error", "error_code"),
+    [
+        pytest.param(_parse_draft, 500, "INTERNAL_ERROR", "ValidationError", id="direct"),
+        pytest.param(
+            _wrapped_draft, 503, "SERVICE_UNAVAILABLE", "ProviderResponseError", id="wrapped"
+        ),
+    ],
+)
+def test_validation_failure_is_logged_once_by_type_without_the_rejected_text(
     make_settings: Callable[..., Settings],
     caplog: pytest.LogCaptureFixture,
+    failure: Callable[[], None],
+    status: int,
+    error: str,
+    error_code: str,
 ) -> None:
     app = make_app(make_context(make_settings()))
 
     @app.get("/parse")
     async def parse() -> None:
-        GenerationDraft.model_validate_json('{"answer": "Acme bills 4')
+        failure()
 
     with caplog.at_level(logging.ERROR):
         response = TestClient(app, raise_server_exceptions=False).get("/parse")
 
     failures = [record for record in caplog.records if record.getMessage() == "Request failed"]
-    assert response.status_code == 500
+    assert response.status_code == status
+    assert response.json()["error"] == error
+    assert "Acme" not in response.text
     assert len(failures) == 1
-    assert failures[0].exc_info is None
-    assert "Acme" not in caplog.text
+    rendered = JsonFormatter().format(failures[0])
+    payload = json.loads(rendered)
+    assert payload["error_code"] == error_code
+    assert payload["request_id"] == response.headers["x-request-id"]
+    assert "ValidationError" in payload["exception"]
+    assert "Acme" not in rendered
 
 
 def test_deadline_error_is_504_and_records_failure(
@@ -344,6 +384,44 @@ def test_provider_timeout_is_504_operation_timeout_not_a_deadline_and_records_fa
     assert response.json()["error"] == "OPERATION_TIMEOUT"
     assert [dict(event.attributes) for event in failed] == [{"error_code": "TimeoutError"}]
     assert failed[0].request_id == response.headers["x-request-id"]
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "code"),
+    [
+        pytest.param(
+            OperationTimeoutError("Qdrant operation timed out"),
+            504,
+            "OPERATION_TIMEOUT",
+            id="adapter-transport-timeout",
+        ),
+        pytest.param(TimeoutError(), 504, "OPERATION_TIMEOUT", id="stage-timer"),
+        pytest.param(
+            ProviderError("Cohere reranking call failed"),
+            503,
+            "SERVICE_UNAVAILABLE",
+            id="ordinary-upstream-error",
+        ),
+        pytest.param(
+            RequestDeadlineExceededError("The RAG request exceeded its global deadline"),
+            504,
+            "REQUEST_DEADLINE_EXCEEDED",
+            id="global-deadline",
+        ),
+    ],
+)
+def test_failure_kinds_keep_their_public_status_and_error_code(
+    make_settings: Callable[..., Settings], error: Exception, status: int, code: str
+) -> None:
+    context = make_context(make_settings(), query=FakeQueryHandler(error))
+
+    response = TestClient(make_app(context)).post(
+        "/v1/rag/query", json={"message": "question"}, headers=TRUSTED_HEADERS
+    )
+
+    assert (response.status_code, response.json()["error"]) == (status, code)
+    failed = context.telemetry.named("http.request.failed")
+    assert [dict(event.attributes) for event in failed] == [{"error_code": type(error).__name__}]
 
 
 def test_ready_route_reports_ready_when_dependencies_pass(
@@ -474,6 +552,18 @@ async def test_readiness_runs_every_dependency_check() -> None:
     await DependencyReadinessHandler(checks).check()
 
     assert [check.calls for check in checks] == [1, 1]
+
+
+async def test_readiness_reports_a_dependency_timeout_as_unavailable() -> None:
+    checks = [
+        RecordingCheck(),
+        RecordingCheck(OperationTimeoutError("MongoDB operation timed out")),
+    ]
+
+    with pytest.raises(InfrastructureError, match="did not answer in time") as caught:
+        await DependencyReadinessHandler(checks).check()
+
+    assert not isinstance(caught.value, TimeoutError)
 
 
 async def test_readiness_reports_a_failed_dependency() -> None:

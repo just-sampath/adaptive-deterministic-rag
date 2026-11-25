@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import unquote_plus, urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pymongo.errors import PyMongoError
+from pymongo.uri_parser_shared import split_options
 
 from utils.errors import ConfigurationError
 
@@ -249,7 +252,10 @@ class AnswersConfig(ConfigModel):
 class ExternalSettings(BaseSettings):
     """Values that vary by deployment or must not be committed."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
+    # Rejected values here can be credentials or credentialed URLs, so errors never echo input.
+    model_config = SettingsConfigDict(
+        env_file=".env", env_prefix="", extra="ignore", hide_input_in_errors=True
+    )
 
     app_env: Environment = Environment.PRODUCTION
     config_dir: Path = Path("config")
@@ -291,11 +297,15 @@ class ExternalSettings(BaseSettings):
         uri = value.get_secret_value()
         if not uri.startswith(("mongodb://", "mongodb+srv://")):
             raise ValueError("MONGODB_URI must use mongodb:// or mongodb+srv://")
+        mongodb_transport(uri)
         return value
 
 
 class Settings(ConfigModel):
     """Validated application settings resolved before the service graph."""
+
+    # Model-level errors would otherwise print the whole input, including the external values.
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     app: AppConfig = Field(default_factory=AppConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
@@ -389,20 +399,81 @@ def _validate_production_transport(external: ExternalSettings) -> None:
         if credential is not None
     ):
         raise ValueError("Provider endpoints that receive API keys must use HTTPS in production")
-    if _mongodb_credentials_without_tls(external.mongodb_uri.get_secret_value()):
+    transport = mongodb_transport(external.mongodb_uri.get_secret_value())
+    if transport.credentialed and not transport.encrypted:
         raise ValueError("MongoDB URIs that carry credentials must use TLS in production")
 
 
-def _mongodb_credentials_without_tls(uri: str) -> bool:
-    """Return whether a MongoDB URI sends a username or password without requesting TLS."""
+@dataclass(frozen=True, slots=True)
+class MongoTransport:
+    """Whether a MongoDB URI sends credentials and whether it explicitly requests TLS."""
 
-    parts = urlsplit(uri)
-    if parts.username is None and parts.password is None:
-        return False
-    if parts.scheme == "mongodb+srv":
-        return False
-    options = {key.lower(): value for key, value in parse_qsl(parts.query)}
-    return options.get("tls") != "true" and options.get("ssl") != "true"
+    credentialed: bool
+    encrypted: bool
+
+
+# Options whose repetition would let one spelling silently override another. The driver keeps the
+# last value and only warns, so a duplicate is rejected before its options are collapsed.
+_MONGODB_SECURITY_OPTIONS = frozenset(
+    {
+        "tls",
+        "ssl",
+        "tlsinsecure",
+        "tlsallowinvalidcertificates",
+        "tlsallowinvalidhostnames",
+        "tlscafile",
+        "tlscrlfile",
+        "tlscertificatekeyfile",
+        "tlscertificatekeyfilepassword",
+        "tlsdisablecertificaterevocationcheck",
+        "tlsdisableocspendpointcheck",
+        "authmechanism",
+        "authmechanismproperties",
+        "authsource",
+    }
+)
+_INVALID_MONGODB_OPTIONS = "MONGODB_URI has invalid, repeated or conflicting connection options"
+
+
+def mongodb_transport(uri: str) -> MongoTransport:
+    """Resolve whether a MongoDB URI carries credentials and requests TLS.
+
+    This follows PyMongo's own parsing: option names are case-insensitive, ``ssl`` is an alias
+    of ``tls``, conflicting ``tls``/``ssl`` values are an error, and a ``mongodb+srv`` URI
+    defaults to TLS unless it sets ``tls`` or ``ssl`` itself (DNS TXT records cannot set them).
+    Only ``tls``, ``ssl`` and the SRV default count as requesting TLS, although the driver also
+    enables it for options such as ``tlsCAFile``. No hostname is resolved and no client is
+    built; the driver's option validators only check that a named TLS file can be opened.
+    Errors never include the URI.
+    """
+
+    srv = uri.startswith("mongodb+srv://")
+    scheme_free = uri.split("://", 1)[1] if "://" in uri else uri
+    location, _, query = scheme_free.partition("?")
+    hosts = location.partition("/")[0]
+    options: Any = {}
+    if query:
+        _reject_repeated_security_options(query)
+        try:
+            options = split_options(query)
+        except (PyMongoError, ValueError, TypeError, OSError):
+            # The driver's messages can quote option values, and a missing TLS file raises an
+            # OSError naming its path, so the cause is not chained.
+            raise ValueError(_INVALID_MONGODB_OPTIONS) from None
+    credentialed = "@" in hosts or "authmechanism" in options
+    tls = options.get("tls")
+    return MongoTransport(credentialed=credentialed, encrypted=srv if tls is None else tls is True)
+
+
+def _reject_repeated_security_options(query: str) -> None:
+    seen: set[str] = set()
+    for item in query.replace(";", "&").split("&"):
+        name = unquote_plus(item.partition("=")[0]).lower()
+        if name not in _MONGODB_SECURITY_OPTIONS:
+            continue
+        if name in seen:
+            raise ValueError(_INVALID_MONGODB_OPTIONS)
+        seen.add(name)
 
 
 def load_settings(external: ExternalSettings | None = None) -> Settings:

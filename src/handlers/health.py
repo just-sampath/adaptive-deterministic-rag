@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 from services.contracts import HealthCheck
 from utils.concurrency import run_all
+from utils.errors import InfrastructureError
 
 
 class DependencyReadinessHandler:
@@ -13,4 +14,8 @@ class DependencyReadinessHandler:
         self._checks = tuple(checks)
 
     async def check(self) -> None:
-        await run_all(check.health_check() for check in self._checks)
+        try:
+            await run_all(check.health_check() for check in self._checks)
+        except TimeoutError as exc:
+            # A dependency that cannot answer in time is not ready; probes expect 503, not 504.
+            raise InfrastructureError("A dependency did not answer in time") from exc

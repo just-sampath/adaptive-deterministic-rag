@@ -37,3 +37,11 @@ class AuthorizationError(RagError):
 
 class RequestDeadlineExceededError(InfrastructureError):
     """Raised when the global deterministic execution budget is exhausted."""
+
+
+class OperationTimeoutError(TimeoutError):
+    """Raised when an upstream client's own transport timeout expires.
+
+    It is a ``TimeoutError`` and deliberately not an ``InfrastructureError``, so a provider's
+    timeout is reported like the surrounding stage timer's rather than as an outage.
+    """

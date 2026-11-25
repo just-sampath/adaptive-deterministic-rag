@@ -80,7 +80,8 @@ There is no separate build step. `docker compose up --build` builds and runs the
 - Production fails closed: an unset `APP_ENV` means production, and startup rejects placeholder or
   weak secrets and plain-HTTP credentialed endpoints. Don't relax these checks.
 - Every new free-text trace field goes through `TelemetryService` redaction. Logs never contain
-  request text, answers, secrets or rejected input; validation failures are logged by type only.
+  request text, answers, secrets or rejected input. The JSON formatter writes exceptions as types
+  and frame locations only (`utils/logging.py`), and settings errors never echo their input.
   SDK loggers that can print payloads stay at `WARNING`.
 - Personal data and secrets are never put in URLs or query strings.
 - Model output selects among fixed branches. It never names a strategy, adds a step or changes a

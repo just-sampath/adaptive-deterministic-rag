@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 
 from models.domain import RankedChunk
-from utils.errors import ProviderError, ProviderResponseError
+from utils.errors import OperationTimeoutError, ProviderError, ProviderResponseError
 
 
 class CohereReranker:
@@ -53,6 +53,8 @@ class CohereReranker:
                 },
             )
             response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise OperationTimeoutError("Cohere reranking call timed out") from exc
         except httpx.HTTPError as exc:
             raise ProviderError("Cohere reranking call failed") from exc
         try:
