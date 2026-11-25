@@ -9,6 +9,11 @@ the suite.
 `src/services/evaluation.py`: recall@k, precision@k, reciprocal rank, and binary NDCG@k. Evaluation
 is intentionally an offline concern; this RAG backend exposes no evaluation or ingestion route.
 
+Binary NDCG@k walks the first k results in rank order. A relevant ID earns `1 / log2(rank + 1)` at
+its first position only; a repeated copy still takes up its rank and earns nothing, so a score is
+always between 0 and 1. The ideal ranking places `min(len(relevant), k)` relevant IDs first. With
+`k = 0` or no relevant IDs the score is 1. Negative cutoffs are outside the metric's contract.
+
 For end-to-end evaluation, send each golden question to `/v1/rag/query`, retain its MongoDB trace,
 and score these dimensions independently:
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 import pytest
@@ -532,6 +533,55 @@ def test_offline_ranking_metrics_have_expected_values() -> None:
     assert precision_at_k(retrieved, relevant, 2) == 0.5
     assert reciprocal_rank(retrieved, relevant) == 0.5
     assert ndcg_at_k(retrieved, relevant, 3) == pytest.approx(0.3868528072)
+
+
+@pytest.mark.parametrize(
+    ("retrieved", "relevant", "k", "expected"),
+    [
+        pytest.param(["r", "s"], {"r", "s"}, 2, 1.0, id="unique-perfect"),
+        pytest.param(
+            ["x", "y", "r"],
+            {"r"},
+            3,
+            1 / math.log2(4),
+            id="relevant-last",
+        ),
+        pytest.param(
+            ["x", "s", "r"],
+            {"r", "s"},
+            3,
+            (1 / math.log2(3) + 1 / math.log2(4)) / (1 + 1 / math.log2(3)),
+            id="reversed",
+        ),
+        pytest.param(["r", "r"], {"r"}, 2, 1.0, id="repeated-relevant"),
+        pytest.param(["x", "r"], {"r"}, 2, 1 / math.log2(3), id="relevant-second"),
+        pytest.param(["x", "x", "r"], {"r"}, 3, 1 / math.log2(4), id="repeated-irrelevant"),
+        # The copy of r keeps rank 2, so s falls below the cutoff instead of being promoted.
+        pytest.param(
+            ["r", "r", "s"],
+            {"r", "s"},
+            2,
+            1 / (1 + 1 / math.log2(3)),
+            id="second-relevant-below-cutoff",
+        ),
+        pytest.param(["r"], {"r"}, 0, 1, id="zero-cutoff"),
+        pytest.param(["x"], set(), 3, 1, id="nothing-relevant"),
+    ],
+)
+def test_ndcg_counts_each_relevant_id_once_at_its_first_rank(
+    retrieved: list[str], relevant: set[str], k: int, expected: float
+) -> None:
+    score = ndcg_at_k(retrieved, relevant, k)
+
+    assert score == pytest.approx(expected)
+    assert 0 <= score <= 1
+
+
+def test_ndcg_stays_normalized_when_every_result_repeats_a_relevant_id() -> None:
+    # The old sum gave 1.63093 for the first case: every copy of r earned a gain.
+    assert ndcg_at_k(["r", "r"], {"r"}, 2) == 1.0
+    assert ndcg_at_k(["r", "r", "r"], {"r"}, 3) == 1.0
+    assert ndcg_at_k(["r", "r", "s"], {"r", "s"}, 2) < 1.0
 
 
 async def test_generation_is_bounded_by_its_stage_budget() -> None:

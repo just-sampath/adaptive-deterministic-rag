@@ -311,6 +311,22 @@ It creates the physical collection and alias when they are missing, writes dense
 BM25 sparse vectors, and links chunks in sequence. It uses the same encoder settings as the API, so
 both resolve to the same physical collection.
 
+Seeding the handbook again is safe. The first seed creates one document, one version, two chunks
+and two points, then advances the tenant's `system_state.corpus_version` by one. A repeat keeps
+the same IDs and creation times and leaves `corpus_version` alone, but it restores any missing
+rows or points, embedding only the missing passages. An interrupted seed resumes on the next run
+and is counted once, as are two runs started together. The tenant's `system_state.local_seed`
+records a fingerprint of the handbook content and whether its seed completed. Before writing
+anything, the script refuses records under the handbook's fixed IDs that hold other content, and
+a seed record for different content.
+
+A handbook seeded by an older version of the script left no completion record. If its records
+exist and the tenant already has a `corpus_version`, the script can't tell whether that seed was
+counted, so it stops and asks. Rerun with `--legacy-counter adopt` if it was counted (the counter
+stays as it is) or `--legacy-counter count` if it was interrupted (the counter advances once). The
+choice is stored with the completion record. The script still prints the document ID, version ID
+and number of chunks indexed.
+
 ## Retrieval index
 
 Queries address `vector_store.collection_alias` (default `adaptive_rag_chunks`), not a physical

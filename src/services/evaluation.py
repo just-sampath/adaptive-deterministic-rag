@@ -415,13 +415,18 @@ def reciprocal_rank(retrieved: Sequence[str], relevant: set[str]) -> float:
 
 
 def ndcg_at_k(retrieved: Sequence[str], relevant: set[str], k: int) -> float:
-    """Return binary normalized discounted cumulative gain at k."""
+    """Return binary normalized discounted cumulative gain at k, for a nonnegative k.
 
-    actual = sum(
-        1 / math.log2(rank + 1)
-        for rank, item in enumerate(retrieved[:k], start=1)
-        if item in relevant
-    )
+    A relevant ID earns its gain at its first position only. A later copy still occupies its rank
+    and earns nothing, so a repeated result cannot push the score above 1.
+    """
+
+    credited: set[str] = set()
+    actual = 0.0
+    for rank, item in enumerate(retrieved[:k], start=1):
+        if item in relevant and item not in credited:
+            credited.add(item)
+            actual += 1 / math.log2(rank + 1)
     ideal = sum(1 / math.log2(rank + 1) for rank in range(1, min(len(relevant), k) + 1))
     return actual / ideal if ideal else 1
 
