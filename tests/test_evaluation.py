@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from models.domain import (
+    AttributedFaithfulness,
+    AttributionStatus,
+    CitationAssessment,
     CompletenessEvaluation,
     CompletenessStatus,
     ContradictedClaim,
@@ -19,6 +23,7 @@ from models.domain import (
     RequirementStatus,
     UnsupportedClaim,
 )
+from services.citations import citation_occurrences
 from services.contracts import TextModel
 from services.evaluation import (
     GenerationService,
@@ -29,7 +34,9 @@ from services.evaluation import (
     reciprocal_rank,
 )
 from tests.fakes import FakeTextModel, StalledTextModel, make_chunk
+from utils.errors import ProviderResponseError
 from utils.prompts import (
+    ATTRIBUTION_REPAIR_SYSTEM,
     GENERATOR_SYSTEM,
     PROMPT_VERSIONS,
     generation_user_prompt,
@@ -75,6 +82,77 @@ def _evaluator(model: TextModel) -> OnlineEvaluator:
         max_output_tokens=256,
         timeout_seconds=1,
     )
+
+
+@pytest.mark.parametrize(
+    ("answer", "assessments", "uncited", "passes"),
+    [
+        ("Both [E1, E2]. Tea [E1].", [(1, ("E1", "E2")), (2, ("E1",))], False, True),
+        ("Tea [E2]. Coffee [E1].", [(1, ("E1",)), (2, ("E2",))], False, False),
+        ("Both [E1, E2].", [(1, ("E1",))], False, False),
+        ("Both [E1, E9].", [(1, ("E1", "E9"))], False, False),
+        ("Tea [E1].", [(1, ("E1", "E1"))], False, False),
+        ("Tea [E1]. Coffee [E2].", [(1, ("E1",))], False, False),
+        ("Tea [E1].", [(1, ("E1",)), (1, ("E1",))], False, False),
+        ("Tea [E1].", [(2, ("E1",))], False, False),
+        ("Tea [E1]. Coffee.", [(1, ("E1",))], True, False),
+        ("Tea.", [], False, False),
+        ("Tea [E1].", [(1, ("untrusted model text",))], False, False),
+    ],
+)
+async def test_location_and_label_coverage(
+    answer: str, assessments: list[tuple[int, tuple[str, ...]]], uncited: bool, passes: bool
+) -> None:
+    model = FakeTextModel()
+    context = _context()
+    second = make_chunk("second")
+    context = context.model_copy(
+        update={
+            "chunks": (*context.chunks, RankedChunk(chunk=second, fusion_score=1, fusion_rank=2))
+        }
+    )
+    model.queue(
+        AttributedFaithfulness,
+        AttributedFaithfulness(
+            passed=True,
+            failure_type=FaithfulnessStatus.SUPPORTED,
+            verified_sources=("E1", "E2"),
+            confidence=1,
+            occurrence_assessments=tuple(
+                CitationAssessment(
+                    occurrence_id=i,
+                    supported_labels=labels,
+                    attribution_status=AttributionStatus.SUPPORTED,
+                )
+                for i, labels in assessments
+            ),
+            has_uncited_material_claims=uncited,
+        ),
+    )
+    model.queue(
+        CompletenessEvaluation,
+        CompletenessEvaluation(
+            passed=True,
+            failure_type=CompletenessStatus.COMPLETE,
+            confidence=1,
+            requirements=(
+                RequirementEvaluation(
+                    requirement="Drinks",
+                    status=RequirementStatus.ANSWERED,
+                    available_in_context=True,
+                    supporting_chunks=("E1",),
+                ),
+            ),
+        ),
+    )
+    rows = citation_occurrences(answer)
+    assert rows is not None
+    result = await _evaluator(model).evaluate(
+        query=QUERY, answer=answer, context=context, occurrences=rows
+    )
+    assert result.faithfulness.passed is passes
+    assert result.faithfulness.verified_sources == ((CHUNK_ID, second.id) if passes else ())
+    assert "untrusted model text" not in result.faithfulness.model_dump_json()
 
 
 async def test_online_evaluator_maps_labels_to_chunk_ids_and_drops_unknown_values() -> None:
@@ -510,3 +588,214 @@ def test_prompt_versions_record_the_revision_of_each_model_stage() -> None:
         "completeness": "completeness:v3",
         "repair": "repair:v3",
     }
+
+
+def _attributed_pass() -> AttributedFaithfulness:
+    return AttributedFaithfulness(
+        passed=True,
+        failure_type=FaithfulnessStatus.SUPPORTED,
+        verified_sources=("E1",),
+        confidence=1,
+        occurrence_assessments=(
+            CitationAssessment(
+                occurrence_id=1,
+                supported_labels=("E1",),
+                attribution_status=AttributionStatus.SUPPORTED,
+            ),
+        ),
+        has_uncited_material_claims=False,
+    )
+
+
+def _answered(requirement: str, *labels: str) -> RequirementEvaluation:
+    return RequirementEvaluation(
+        requirement=requirement,
+        status=RequirementStatus.ANSWERED,
+        available_in_context=True,
+        supporting_chunks=labels,
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "requirements", "outcome"),
+    [
+        pytest.param(
+            CompletenessStatus.COMPLETE,
+            (_answered("stop", "E1", "E9"),),
+            "passes",
+            id="valid-label",
+        ),
+        pytest.param(CompletenessStatus.COMPLETE, (), "malformed", id="no-requirements"),
+        pytest.param(
+            CompletenessStatus.COMPLETE, (_answered("  ", "E1"),), "malformed", id="blank"
+        ),
+        pytest.param(
+            CompletenessStatus.COMPLETE, (_answered("stop", "E9"),), "malformed", id="no-support"
+        ),
+        pytest.param(
+            CompletenessStatus.COMPLETE,
+            (
+                _answered("stop", "E1"),
+                RequirementEvaluation(requirement="cost", status=RequirementStatus.MISSING),
+            ),
+            "fails",
+            id="complete-with-missing-item",
+        ),
+        pytest.param(CompletenessStatus.QUESTION_NOT_ANSWERABLE, (), "fails", id="not-answerable"),
+    ],
+)
+async def test_verified_completeness_needs_a_supported_material_requirement(
+    status: CompletenessStatus,
+    requirements: tuple[RequirementEvaluation, ...],
+    outcome: str,
+) -> None:
+    model = FakeTextModel()
+    model.queue(AttributedFaithfulness, _attributed_pass())
+    model.queue(
+        CompletenessEvaluation,
+        CompletenessEvaluation(
+            passed=status is CompletenessStatus.COMPLETE,
+            failure_type=status,
+            requirements=requirements,
+            confidence=1,
+        ),
+    )
+    answer = "It stops at the limit [E1]."
+    evaluate = _evaluator(model).evaluate(
+        query=QUERY, answer=answer, context=_context(), occurrences=citation_occurrences(answer)
+    )
+
+    if outcome == "malformed":
+        with pytest.raises(ProviderResponseError):
+            await evaluate
+        return
+    result = await evaluate
+    assert result.completeness.passed is (outcome == "passes")
+    if outcome == "passes":
+        assert result.completeness.requirements[0].supporting_chunks == (CHUNK_ID,)
+
+
+class _PromptRecorder(FakeTextModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.system_prompts: list[str] = []
+        self.user_prompts: list[str] = []
+
+    async def complete(self, **kwargs: Any) -> Any:
+        self.system_prompts.append(kwargs["system_prompt"])
+        self.user_prompts.append(kwargs["user_prompt"])
+        return await super().complete(**kwargs)
+
+
+async def test_attribution_repair_receives_the_judged_occurrence_table() -> None:
+    model = _PromptRecorder()
+    model.queue(GenerationDraft, GenerationDraft(answer="Tea [E1]."))
+    service = GenerationService(
+        model=model, model_name="fake", max_output_tokens=256, timeout_seconds=1
+    )
+    faithfulness = _attributed_pass().model_copy(
+        update={
+            "passed": False,
+            "failure_type": FaithfulnessStatus.UNSUPPORTED_CLAIMS,
+            "verified_sources": (),
+        }
+    )
+
+    await service.repair(
+        query=QUERY,
+        previous_answer="Coffee [E2]. Tea [E1].",
+        context=_context(),
+        faithfulness=faithfulness,
+        completeness=CompletenessEvaluation(
+            passed=True,
+            failure_type=CompletenessStatus.COMPLETE,
+            requirements=(_answered("tea", CHUNK_ID),),
+            confidence=1,
+        ),
+    )
+
+    assert model.system_prompts == [ATTRIBUTION_REPAIR_SYSTEM]
+    payload = json.loads(model.user_prompts[0])
+    assert payload["previous_citation_occurrences"] == [
+        {"occurrence_id": 1, "start": 7, "end": 11, "claimed_labels": ["E2"]},
+        {"occurrence_id": 2, "start": 17, "end": 21, "claimed_labels": ["E1"]},
+    ]
+    assert payload["faithfulness_feedback"]["occurrence_assessments"][0]["occurrence_id"] == 1
+
+
+def _two_passage_context() -> tuple[PackedContext, str]:
+    context = _context()
+    second = make_chunk("second")
+    return (
+        context.model_copy(
+            update={
+                "chunks": (
+                    *context.chunks,
+                    RankedChunk(chunk=second, fusion_score=1, fusion_rank=2),
+                )
+            }
+        ),
+        second.id,
+    )
+
+
+@pytest.mark.parametrize(
+    ("answer", "status", "labels", "judge_verified", "expected"),
+    [
+        # The answer-wide verified list can't add a passage no marker cites.
+        ("Tea [E1].", "supported", ("E1",), ("E1", "E2"), ("first",)),
+        # A label repeated in one group claims one passage.
+        ("Tea [E1, E1].", "supported", ("E1",), ("E1",), ("first",)),
+        # Supported labels with a contradicted status still fail.
+        ("Tea [E1].", "contradicted", ("E1",), ("E1",), ()),
+        # An occurrence-level pass the answer-wide verdict doesn't confirm fails.
+        ("Tea [E1]. Coffee [E2].", "supported", ("E1",), ("E1",), ()),
+    ],
+    ids=["uncited-verified", "repeated-label", "contradicted", "unconfirmed"],
+)
+async def test_verified_sources_come_only_from_accepted_occurrences(
+    answer: str,
+    status: str,
+    labels: tuple[str, ...],
+    judge_verified: tuple[str, ...],
+    expected: tuple[str, ...],
+) -> None:
+    context, second = _two_passage_context()
+    occurrences = citation_occurrences(answer)
+    assert occurrences is not None
+    model = FakeTextModel()
+    model.queue(
+        AttributedFaithfulness,
+        AttributedFaithfulness(
+            passed=True,
+            failure_type=FaithfulnessStatus.SUPPORTED,
+            verified_sources=judge_verified,
+            confidence=1,
+            occurrence_assessments=tuple(
+                CitationAssessment(
+                    occurrence_id=row.occurrence_id,
+                    supported_labels=row.claimed_labels if len(occurrences) > 1 else labels,
+                    attribution_status=AttributionStatus(status),
+                )
+                for row in occurrences
+            ),
+            has_uncited_material_claims=False,
+        ),
+    )
+    model.queue(
+        CompletenessEvaluation,
+        CompletenessEvaluation(
+            passed=True,
+            failure_type=CompletenessStatus.COMPLETE,
+            confidence=1,
+            requirements=(_answered("Drinks", "E1"),),
+        ),
+    )
+
+    result = await _evaluator(model).evaluate(
+        query=QUERY, answer=answer, context=context, occurrences=occurrences
+    )
+
+    ids = {"first": CHUNK_ID, "second": second}
+    assert result.faithfulness.passed is bool(expected)
+    assert result.faithfulness.verified_sources == tuple(ids[item] for item in expected)

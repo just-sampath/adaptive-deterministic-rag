@@ -92,6 +92,7 @@ context:
   short_chunk_tokens: 40
 
 policy:
+  verify_answers: false
   max_generation_repairs: 1
   max_strategies: 4
   allow_verified_partial: true

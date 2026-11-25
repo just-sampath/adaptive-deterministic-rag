@@ -12,6 +12,9 @@ from handlers.policy import DecisionPolicy
 from handlers.search import SearchHandler
 from handlers.search_strategies.registry import build_strategy_registry
 from models.domain import (
+    MAX_CITATION_OCCURRENCES,
+    AttemptOutcome,
+    AttributedFaithfulness,
     Chunk,
     Citation,
     CompletenessEvaluation,
@@ -179,6 +182,7 @@ def build_orchestrator(
     contextualization: ContextualizationConfig | None = None,
     history_ref_limit: int = 8,
     telemetry: TelemetryService | None = None,
+    policy: PolicyConfig | None = None,
 ) -> SearchHandler:
     retrieval = RetrievalConfig(
         happy_dense_k=4,
@@ -196,7 +200,7 @@ def build_orchestrator(
         max_neighbors_per_seed=max_neighbors,
     )
     contextualization = contextualization or ContextualizationConfig()
-    policy = PolicyConfig()
+    policy = policy or PolicyConfig()
     encoder = HybridQueryEncoder(
         dense=FakeEmbeddings(),
         sparse=Bm25SparseEncoder(SparseConfig()),
@@ -278,6 +282,26 @@ def _supported() -> FaithfulnessEvaluation:
         failure_type=FaithfulnessStatus.SUPPORTED,
         verified_sources=("E1",),
         confidence=1,
+    )
+
+
+def _attributed(
+    *groups: tuple[str, ...], verified: tuple[str, ...] = ("E1",)
+) -> AttributedFaithfulness:
+    return AttributedFaithfulness.model_validate(
+        {
+            **_supported().model_dump(),
+            "verified_sources": verified,
+            "has_uncited_material_claims": False,
+            "occurrence_assessments": [
+                {
+                    "occurrence_id": index,
+                    "supported_labels": labels,
+                    "attribution_status": "supported" if labels else "unsupported",
+                }
+                for index, labels in enumerate(groups, 1)
+            ],
+        }
     )
 
 
@@ -773,14 +797,127 @@ async def test_inline_citations_disabled_returns_plain_answer(identity: Identity
     assert response.citations == ()
 
 
+@pytest.mark.parametrize("draft", ["", "   ", "[E1].", "[E1, E2] … !"])
+async def test_invalid_draft_skips_judges_and_abstains(identity: Identity, draft: str) -> None:
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    queue_complete_answer(model, draft)
+    handler = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=hit_store(),
+        policy=PolicyConfig(max_strategies=1, verify_answers=True),
+    )
+    response = await handler.query(identity, QueryRequest(message="Explain the feature"))
+    assert response.status is ResultStatus.INSUFFICIENT_EVIDENCE
+    assert model.calls == [GenerationDraft]
+    (attempt,) = repository.traces[response.request_id].attempts
+    assert attempt.faithfulness is None and attempt.completeness is None
+    assert attempt.token_usage.total_tokens > 0
+    assert attempt.decision and attempt.decision.hypothesis is RetryHypothesis.UNCLASSIFIED
+
+
+def test_malformed_complete_verdict_returns_503(
+    identity: Identity, make_settings: Callable[..., Settings]
+) -> None:
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    model.queue(GenerationDraft, GenerationDraft(answer="No [E1]."))
+    model.queue(AttributedFaithfulness, _attributed(("E1",)))
+    model.queue(
+        CompletenessEvaluation, _complete_evaluation().model_copy(update={"requirements": ()})
+    )
+    handler = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=hit_store(),
+        policy=PolicyConfig(verify_answers=True),
+    )
+    with TestClient(
+        make_app(make_context(make_settings(), query=handler, repository=repository))
+    ) as client:
+        response = client.post(
+            "/v1/rag/query", headers=TRUSTED_HEADERS, json={"message": "Is it supported?"}
+        )
+    assert response.status_code == 503
+
+
+@pytest.mark.parametrize(
+    ("repaired", "expected"),
+    [
+        ("No [E1].", ResultStatus.COMPLETE),
+        ("0 [E1]", ResultStatus.COMPLETE),
+        ("[E1].", ResultStatus.INSUFFICIENT_EVIDENCE),
+        ("No " + "[E1]" * (MAX_CITATION_OCCURRENCES + 1), ResultStatus.INSUFFICIENT_EVIDENCE),
+    ],
+)
+async def test_swapped_citations_need_a_new_verified_draft(
+    identity: Identity, repaired: str, expected: ResultStatus
+) -> None:
+    second = "00000000-0000-0000-0000-000000000002"
+    repository = FakeRepository(
+        (make_chunk(CHUNK_ID, text="Tea"), make_chunk(second, text="Coffee", document_id="doc-b"))
+    )
+    store = hit_store()
+    store.dense_hits.append(SearchHit(chunk_id=second, score=0.8, rank=2))
+    model = FakeTextModel()
+    model.queue(
+        GenerationDraft,
+        GenerationDraft(answer="Tea [E2]. Coffee [E1]."),
+        GenerationDraft(answer=repaired),
+    )
+    model.queue(
+        AttributedFaithfulness, _attributed((), (), verified=("E1", "E2")), _attributed(("E1",))
+    )
+    model.queue(CompletenessEvaluation, _complete_evaluation(), _complete_evaluation())
+    handler = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=store,
+        policy=PolicyConfig(verify_answers=True, max_strategies=1),
+    )
+    response = await handler.query(identity, QueryRequest(message="What is served?"))
+    assert response.status is expected
+    trace = repository.traces[response.request_id]
+    original, repair = trace.attempts
+    assert original.faithfulness and not original.faithfulness.passed
+    assert not original.faithfulness.verified_sources
+    assert trace.generation_repair_used and repair.generation_repair_attempted
+    faith_prompts = [
+        json.loads(p) for typ, p in model.output_prompts if typ is AttributedFaithfulness
+    ]
+    assert [row["claimed_labels"] for row in faith_prompts[0]["citation_occurrences"]] == [
+        ["E2"],
+        ["E1"],
+    ]
+    assert [row["evidence_label"] for row in faith_prompts[0]["evidence"]] == ["E1", "E2"]
+    if expected is ResultStatus.COMPLETE:
+        assert trace.final_source_ids == (CHUNK_ID,)
+        assert response.citations == (CITATION,)
+        assert [row["occurrence_id"] for row in faith_prompts[1]["citation_occurrences"]] == [1]
+    else:
+        assert (
+            len(faith_prompts) == 1 and repair.faithfulness is None and repair.completeness is None
+        )
+        assert repair.outcome in {AttemptOutcome.EMPTY_DRAFT, AttemptOutcome.CITATION_LIMIT}
+        assert response.sources == () and response.citations == ()
+
+
+@pytest.mark.parametrize("verify", [False, True])
 async def test_orchestrator_exhausts_each_retrieval_strategy_once_then_abstains(
     identity: Identity,
+    verify: bool,
 ) -> None:
     repository = FakeRepository()
     vector_store = FakeVectorSearch()
     model = FakeTextModel()
     model.queue(QueryRecoveryOutput, QueryRecoveryOutput(keyword_query="exact identifier"))
-    orchestrator = build_orchestrator(model=model, repository=repository, vector_store=vector_store)
+    orchestrator = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=vector_store,
+        policy=PolicyConfig(verify_answers=verify),
+    )
 
     response = await orchestrator.query(identity, QueryRequest(message="Unknown fact"))
 
@@ -792,6 +929,16 @@ async def test_orchestrator_exhausts_each_retrieval_strategy_once_then_abstains(
     decisions = _decisions(trace)
     assert [decision.hypothesis for decision in decisions] == [RetryHypothesis.LOW_RECALL] * 3
     assert [decision.next_strategy for decision in decisions] == [RECALL, RECOVERY, None]
+    assert trace.attempted_strategies == (HAPPY, RECALL, RECOVERY)
+    assert model.calls == [QueryRecoveryOutput]
+    assert [item.failure_types for item in trace.attempts] == [(RagFailure.LOW_RECALL,)] * 3
+    if verify:
+        assert all(
+            item.outcome is AttemptOutcome.EMPTY_EVIDENCE
+            and item.faithfulness is None
+            and item.completeness is None
+            for item in trace.attempts
+        )
 
 
 class _HandbookReranker(FakeReranker):
@@ -1697,3 +1844,90 @@ async def test_selected_partial_rechecks_its_own_evidence(
         repository.messages[identity.tenant_id, identity.user_id, "guide"][-1].content
         == response.answer
     )
+
+
+async def test_blank_repair_cannot_replace_an_earlier_verified_partial(
+    identity: Identity,
+) -> None:
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    model.queue(GenerationDraft, GenerationDraft(answer="Advantages [E1]."))
+    model.queue(AttributedFaithfulness, _attributed(("E1",)))
+    model.queue(
+        CompletenessEvaluation,
+        CompletenessEvaluation(
+            passed=False,
+            failure_type=CompletenessStatus.MISSING_ANSWER_CONTENT,
+            requirements=(
+                RequirementEvaluation(
+                    requirement="advantages",
+                    status=RequirementStatus.ANSWERED,
+                    available_in_context=True,
+                    supporting_chunks=("E1",),
+                ),
+                RequirementEvaluation(
+                    requirement="limitations",
+                    status=RequirementStatus.MISSING,
+                    available_in_context=True,
+                    supporting_chunks=("E1",),
+                ),
+            ),
+            missing_information_available=True,
+            confidence=1,
+        ),
+    )
+    model.queue(GenerationDraft, GenerationDraft(answer=" [E1] "))
+    handler = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=hit_store(),
+        policy=PolicyConfig(verify_answers=True, max_strategies=1),
+    )
+
+    response = await handler.query(identity, QueryRequest(message="Explain the feature"))
+
+    assert response.status is ResultStatus.VERIFIED_PARTIAL
+    assert response.answer.startswith("Advantages [1].")
+    assert response.unanswered_requirements == ("limitations",)
+    trace = repository.traces[response.request_id]
+    original, repair = trace.attempts
+    assert original.outcome is AttemptOutcome.EVALUATED
+    assert repair.outcome is AttemptOutcome.EMPTY_DRAFT
+    assert repair.generation_repair_attempted and trace.generation_repair_used
+    assert model.calls.count(AttributedFaithfulness) == 1
+
+
+async def test_malformed_complete_verdict_salvages_an_earlier_verified_partial(
+    identity: Identity,
+) -> None:
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    model.queue(QueryRecoveryOutput, QueryRecoveryOutput())
+    model.queue(
+        GenerationDraft,
+        GenerationDraft(answer="Advantages [E1]."),
+        GenerationDraft(answer="Advantages and limitations [E1]."),
+    )
+    model.queue(AttributedFaithfulness, _attributed(("E1",)), _attributed(("E1",)))
+    model.queue(
+        CompletenessEvaluation,
+        _partial_evaluation(),
+        _complete_evaluation().model_copy(update={"requirements": ()}),
+    )
+    handler = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=hit_store(),
+        policy=PolicyConfig(verify_answers=True),
+    )
+
+    response = await handler.query(identity, QueryRequest(message="Explain the feature"))
+
+    assert response.status is ResultStatus.VERIFIED_PARTIAL
+    assert response.metadata.degraded is True
+    assert response.answer.startswith("Advantages [1].")
+    assert response.unanswered_requirements == ("limitations",)
+    trace = repository.traces[response.request_id]
+    assert trace.error_code == "ProviderResponseError"
+    assert trace.attempted_strategies == (HAPPY, RECOVERY)
+    assert trace.final_source_ids == (CHUNK_ID,)

@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from models.domain import Chunk, Citation
-from services.citations import CitationRenderer, sources_from_chunks
+from models.domain import MAX_CITATION_OCCURRENCES, Chunk, Citation
+from services.citations import (
+    CitationRenderer,
+    citation_occurrences,
+    has_material_text,
+    sources_from_chunks,
+)
 from tests.fakes import make_chunk
 
 
@@ -219,3 +224,60 @@ def test_sources_group_verified_sections_in_first_seen_order() -> None:
         ("second", ("Start", "Start > Detail")),
         ("first", ()),
     ]
+
+
+def test_occurrences_use_the_rendering_grammar_in_reading_order() -> None:
+    answer = "Use `items[0]` and [42]. Tea [E1]. Both [E1, E2]; see `[E3]`."
+
+    rows = citation_occurrences(answer)
+
+    assert rows is not None
+    assert [
+        (row.occurrence_id, answer[row.start : row.end], row.claimed_labels) for row in rows
+    ] == [
+        (1, "[E1]", ("E1",)),
+        (2, "[E1, E2]", ("E1", "E2")),
+        # The reserved syntax is a marker even inside a code span, exactly as rendering treats it.
+        (3, "[E3]", ("E3",)),
+    ]
+    assert CitationRenderer(inline=True).without_markers(answer) == (
+        "Use `items[0]` and [42]. Tea. Both; see ``."
+    )
+
+
+@pytest.mark.parametrize(
+    ("answer", "accepted"),
+    [
+        (" [E1]" * MAX_CITATION_OCCURRENCES, True),
+        (" [E1]" * (MAX_CITATION_OCCURRENCES + 1), False),
+        ("[" + ", ".join(["E1"] * (MAX_CITATION_OCCURRENCES + 1)) + "]", False),
+    ],
+    ids=["at-limit", "too-many-markers", "too-many-labels"],
+)
+def test_occurrence_table_is_bounded(answer: str, accepted: bool) -> None:
+    rows = citation_occurrences("Tea" + answer)
+
+    assert (rows is not None) is accepted
+
+
+@pytest.mark.parametrize(
+    ("answer", "material"),
+    [
+        ("", False),
+        ("   ", False),
+        ("[E1].", False),
+        ("[E1, E2] … !", False),
+        ("No [E1].", True),
+        ("0 [E1]", True),
+        ("`items[0]`", True),
+        ("$5 [E1]", True),
+        ("```\n[E1]\n```", False),
+        ("> [E1]", False),
+        ("| [E1] |", False),
+        ("+ [E1] = ~", False),
+    ],
+)
+def test_material_text_ignores_markers_whitespace_and_punctuation(
+    answer: str, material: bool
+) -> None:
+    assert has_material_text(answer) is material

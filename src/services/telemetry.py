@@ -136,8 +136,12 @@ class TelemetryService:
                 "retrieval_queries": tuple(
                     self.redact_text(query) for query in attempt.retrieval_queries
                 ),
-                "faithfulness": self._project_faithfulness(attempt.faithfulness),
-                "completeness": self._project_completeness(attempt.completeness),
+                "faithfulness": self._project_faithfulness(attempt.faithfulness)
+                if attempt.faithfulness
+                else None,
+                "completeness": self._project_completeness(attempt.completeness)
+                if attempt.completeness
+                else None,
                 "decision": self._project_decision(attempt.decision),
             }
         )

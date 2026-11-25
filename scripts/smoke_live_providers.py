@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel
 
 from models.domain import (
+    AttributedFaithfulness,
     Chunk,
     CompletenessEvaluation,
     ContextualizationOutput,
@@ -23,14 +24,17 @@ from models.domain import (
 )
 from providers.cohere import CohereReranker
 from providers.openai import OpenAIEmbeddingProvider, OpenAITextModel, build_openai_client
+from services.citations import citation_occurrences
 from utils.errors import ConfigurationError
 from utils.prompts import (
+    ATTRIBUTION_SYSTEM,
     COMPLETENESS_SYSTEM,
     CONTEXTUALIZER_SYSTEM,
     FAITHFULNESS_SYSTEM,
     FOLLOWUP_DETECTOR_SYSTEM,
     GENERATOR_SYSTEM,
     QUERY_RECOVERY_SYSTEM,
+    REQUIREMENTS_SYSTEM,
     contextualization_user_prompt,
     evaluation_user_prompt,
     followup_detection_user_prompt,
@@ -130,14 +134,19 @@ def _checks(settings: Settings, text_model: OpenAITextModel) -> list[_Check]:
         structured(
             "faithfulness evaluation",
             ai.evaluation_model,
-            FAITHFULNESS_SYSTEM,
-            evaluation_user_prompt(understanding, _ANSWER, context),
-            FaithfulnessEvaluation,
+            ATTRIBUTION_SYSTEM if settings.policy.verify_answers else FAITHFULNESS_SYSTEM,
+            evaluation_user_prompt(
+                understanding,
+                _ANSWER,
+                context,
+                citation_occurrences(_ANSWER) if settings.policy.verify_answers else None,
+            ),
+            AttributedFaithfulness if settings.policy.verify_answers else FaithfulnessEvaluation,
         ),
         structured(
             "completeness evaluation",
             ai.evaluation_model,
-            COMPLETENESS_SYSTEM,
+            REQUIREMENTS_SYSTEM if settings.policy.verify_answers else COMPLETENESS_SYSTEM,
             evaluation_user_prompt(understanding, _ANSWER, context),
             CompletenessEvaluation,
         ),

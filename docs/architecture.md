@@ -126,7 +126,9 @@ Queries and readiness checks always address the alias.
 | Request has a conversation ID and contextualization is enabled | Read the scoped tail, authorize complete pairs, and project a character-bounded window before detection |
 | Follow-up detected in that window | Propose a standalone question from selected messages. Check explicit anchors and content-word loss before choosing the search and reranking query |
 | Initial request | Run `HAPPY_PATH` |
-| Evaluators both pass | Select `COMPLETE` for final evidence checks |
+| Verification enabled and a draft has no letter or digit outside its markers, more than 32 markers, or more than 32 labels in one marker | Skip both judges, record the attempt outcome, keep any earlier partial, and classify `UNCLASSIFIED`. A blank repair still spends the repair |
+| Evaluators both pass | Select `COMPLETE` for final evidence checks. With verification enabled, every marker must be supported at its position and every answered requirement must cite packed evidence |
+| Verification enabled and the completeness judge reports `COMPLETE` with no named requirement or no valid support | Treat it as a provider response error: salvage an earlier verified partial or fail the request |
 | Correctable generation failure and repair unused | Repair once, then reevaluate. Correctable means the answer omitted content the evidence holds, correcting evidence exists, or an otherwise complete answer has unsupported or contradicted claims to remove; never when the evidence lacks a requirement or no material claim is supported |
 | Any other failure | Classify a retry hypothesis and run its next unused strategy |
 | Budget spent and a verified partial answer exists | Select the best partial for final evidence checks |
@@ -312,6 +314,15 @@ fallback. `rewrite_decision` records `empty`, `unchanged`, `accepted`, `rejected
 `telemetry.write_query_intent_fields` disabled, new MongoDB rows keep the legacy nested keys and
 pending traces expose no decision or score. Enable writes only after upgrading all trace readers.
 Existing enriched rows require compatible readers until those rows expire.
+
+With `policy.verify_answers` enabled, each `AttemptTrace` records an `outcome`: `evaluated`,
+`empty_evidence`, `empty_draft` or `citation_limit`. Only an evaluated attempt carries the two
+judge verdicts, and its faithfulness verdict adds `occurrence_assessments` (occurrence ID,
+supported evidence labels and an attribution status) and `has_uncited_material_claims`. These
+fields hold identifiers, labels and fixed values only, never claim text. The other outcomes
+store no verdicts and keep the generation usage actually spent. A stored attempt without
+`outcome` is a legacy record, read with its verdicts as they were stored. With verification
+disabled, writers emit exactly the legacy attempt layout and the previous prompt versions.
 
 The queue prevents MongoDB telemetry latency from extending a completed RAG response. A pending
 trace stays readable in-process until it is written, and the pending set is capped at the queue

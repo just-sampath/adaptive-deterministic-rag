@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 
-from models.domain import Chunk, Citation, Source
+from models.domain import MAX_CITATION_OCCURRENCES, Chunk, Citation, CitationOccurrence, Source
 
 # Only evidence labels are markers; bracketed numbers and code indexing such as items[0] are text.
 _MARKER = re.compile(r"([ \t]*)\[\s*(E\d+(?:\s*,\s*E\d+)*)\s*\]")
 _LABEL = re.compile(r"E\d+")
 _CLOSING_PUNCTUATION = frozenset(".,;:!?)")
+
+
+def has_material_text(answer: str) -> bool:
+    """Require a letter or digit once reserved markers are removed.
+
+    Whitespace, punctuation and symbols alone, such as Markdown fences, quote markers or table
+    pipes around a marker, are not an answer.
+    """
+    return any(unicodedata.category(char)[0] in {"L", "N"} for char in _MARKER.sub("", answer))
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +36,24 @@ class RenderedAnswer:
             history_text=f"{self.history_text.rstrip()}\n\n{disclosure}",
             citations=self.citations,
         )
+
+
+def citation_occurrences(answer: str) -> tuple[CitationOccurrence, ...] | None:
+    """Return bracket spans in the unmodified draft, or None if it exceeds the wire limit."""
+    occurrences: list[CitationOccurrence] = []
+    for ordinal, match in enumerate(_MARKER.finditer(answer), 1):
+        labels = _labels(match)
+        if ordinal > MAX_CITATION_OCCURRENCES or len(labels) > MAX_CITATION_OCCURRENCES:
+            return None
+        occurrences.append(
+            CitationOccurrence(
+                occurrence_id=ordinal,
+                start=match.start() + len(match.group(1)),
+                end=match.end(),
+                claimed_labels=labels,
+            )
+        )
+    return tuple(occurrences)
 
 
 class CitationRenderer:

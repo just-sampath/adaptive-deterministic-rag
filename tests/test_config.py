@@ -55,8 +55,18 @@ def test_committed_local_overlay_alone_enables_history_provenance() -> None:
         )
 
     assert committed(Environment.LOCAL).contextualization.write_history_provenance is True
+    assert committed(Environment.LOCAL).policy.verify_answers is True
     default = yaml.safe_load((_PROJECT_CONFIG / "default.yaml").read_text(encoding="utf-8"))
     assert default["contextualization"]["write_history_provenance"] is False
+    assert default["policy"]["verify_answers"] is False
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_answer_verification_flag_is_strict(
+    make_settings: Callable[..., Settings], value: object
+) -> None:
+    with pytest.raises(ValidationError, match="bool_type"):
+        make_settings(policy={"verify_answers": value})
 
 
 def test_committed_default_yaml_matches_code_defaults() -> None:

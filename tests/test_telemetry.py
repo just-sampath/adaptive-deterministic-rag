@@ -18,6 +18,11 @@ from pymongo.asynchronous.database import AsyncDatabase
 from managers.telemetry import MongoTelemetrySink
 from middleware.request_telemetry import RequestTelemetryMiddleware
 from models.domain import (
+    AttemptOutcome,
+    AttemptTrace,
+    AttributedFaithfulness,
+    AttributionStatus,
+    CitationAssessment,
     ContextualizationTrace,
     ModelUsage,
     RequestTrace,
@@ -27,6 +32,7 @@ from models.domain import (
 from routes.dependencies import RequestIdentity
 from services.telemetry import TelemetryService
 from tests.fakes import FakeRepository
+from tests.test_redaction import make_attempt
 from utils.errors import InfrastructureError
 from utils.logging import JsonFormatter
 from utils.request_context import current_request_id
@@ -476,3 +482,99 @@ def test_truncation_leaves_non_text_attributes_unchanged() -> None:
     event = TelemetryEvent(event_type="rag.test", attributes=attributes)
 
     assert event.attributes == attributes
+
+
+# The attempt layout written before answer verification, pinned independently of the model.
+_LEGACY_ATTEMPT_KEYS = {
+    "attempt_number",
+    "strategy",
+    "retrieval_queries",
+    "candidate_k",
+    "generation_k",
+    "dense_result_count",
+    "sparse_result_count",
+    "fused_result_count",
+    "candidates",
+    "packed_chunk_ids",
+    "faithfulness",
+    "completeness",
+    "failure_types",
+    "generation_repair_attempted",
+    "latency_ms",
+    "token_usage",
+    "model_calls",
+    "answer_observation",
+    "decision",
+}
+_LEGACY_FAITHFULNESS_KEYS = {
+    "passed",
+    "failure_type",
+    "verified_sources",
+    "unsupported_claims",
+    "contradicted_claims",
+    "correcting_evidence_available",
+    "correcting_chunks",
+    "confidence",
+}
+
+
+def _attempt_with(outcome: AttemptOutcome | None) -> AttemptTrace:
+    legacy = make_attempt()
+    if outcome is None:
+        return legacy
+    update: dict[str, Any] = {"outcome": outcome, "faithfulness": None, "completeness": None}
+    if outcome is AttemptOutcome.EVALUATED:
+        assert legacy.faithfulness is not None
+        update["faithfulness"] = AttributedFaithfulness(
+            **legacy.faithfulness.model_dump(),
+            occurrence_assessments=(
+                CitationAssessment(
+                    occurrence_id=1,
+                    supported_labels=(),
+                    attribution_status=AttributionStatus.UNSUPPORTED,
+                ),
+            ),
+            has_uncited_material_claims=True,
+        )
+        update["completeness"] = legacy.completeness
+    return AttemptTrace.model_validate({**legacy.model_dump(), **update})
+
+
+@pytest.mark.parametrize(
+    "outcome", [None, AttemptOutcome.EVALUATED, AttemptOutcome.EMPTY_DRAFT], ids=str
+)
+async def test_attempt_outcome_layout_and_reads(outcome: AttemptOutcome | None) -> None:
+    collection = create_autospec(AsyncCollection, instance=True)
+    database = cast(AsyncDatabase[dict[str, Any]], {"traces": collection, "events": None})
+    sink = MongoTelemetrySink(database, trace_collection="traces", event_collection="events")
+    trace = make_trace("attempt").model_copy(update={"attempts": (_attempt_with(outcome),)})
+
+    await sink.write_traces([trace])
+
+    document = BSON(BSON.encode(collection.insert_many.await_args.args[0][0])).decode()
+    stored = document["attempts"][0]
+    if outcome is None:
+        # A writer with verification disabled emits exactly the previous attempt layout.
+        assert set(stored) == _LEGACY_ATTEMPT_KEYS
+        assert set(stored["faithfulness"]) == _LEGACY_FAITHFULNESS_KEYS
+    else:
+        assert stored["outcome"] == outcome.value
+    collection.find_one.return_value = document
+    read = await sink.get_trace("attempt", "tenant")
+    assert read is not None
+    assert read.attempts == trace.attempts
+    assert type(read.attempts[0].faithfulness) is type(trace.attempts[0].faithfulness)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"outcome": AttemptOutcome.EMPTY_DRAFT},
+        {"outcome": AttemptOutcome.EVALUATED},
+        {"outcome": None, "faithfulness": None, "completeness": None},
+    ],
+    ids=["verdicts-without-evaluation", "evaluated-without-assessments", "legacy-without-verdicts"],
+)
+def test_attempt_verdicts_must_match_the_outcome(update: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match=r"verdicts|assessments"):
+        AttemptTrace.model_validate({**make_attempt().model_dump(), **update})

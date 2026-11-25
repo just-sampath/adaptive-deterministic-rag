@@ -93,7 +93,7 @@ from environment variables with no application prefix.
 | Source | Examples |
 | --- | --- |
 | `config/default.yaml` | Models, candidate budgets, follow-up detection, policy bounds, timeouts, collection alias, sparse encoder |
-| `config/local.yaml` | Local-only overrides: `DEBUG` logging, conversation provenance writes, and smaller telemetry queue and batch sizes |
+| `config/local.yaml` | Local-only overrides: `DEBUG` logging, conversation provenance writes, answer verification, and smaller telemetry queue and batch sizes |
 | Environment / `.env` | API keys, MongoDB URI, Qdrant URL/key, trusted-header secrets |
 | Environment / `.env` | `APP_ENV`, `CONFIG_DIR`, and `TELEMETRY_HASH_KEY` |
 
@@ -127,6 +127,16 @@ it. Disabling new writes leaves existing rows intact.
 
 After enabling enriched traces, use a compatible reader for rollbacks while those traces exist.
 
+| Answer verification setting | Default | Meaning |
+| --- | --- | --- |
+| `policy.verify_answers` | `false` | Reject blank drafts, check every citation marker against the claim at its position, and record each attempt's outcome in traces. |
+
+`policy.verify_answers` turns on the checks and their trace format together, because
+an attempt rejected before judging has no verdicts to store in the old layout. While it is
+`false`, answers and traces behave as before. `config/local.yaml` sets it to `true`. For other
+deployments, upgrade every trace reader first. After enabling it, roll back only to a reader that
+accepts attempts with an outcome and citation assessments.
+
 `APP_ENV` defaults to `production` when unset, so a missing value fails closed. Production startup
 rejects the placeholder `AUTH_SHARED_TOKEN`, `DEBUG_TOKEN`, and `TELEMETRY_HASH_KEY` values, and it
 rejects any of the three that is shorter than 32 characters or equal to another of the three.
@@ -144,6 +154,7 @@ CONFIG_DIR=config
 # Evidence packing is configured in YAML with context.tokenizer_encoding and context.tokenizer_verified_for.
 # Conversation history writes are configured in YAML with contextualization.write_history_provenance.
 # Query rewrite diagnostics are configured in YAML with telemetry.write_query_intent_fields.
+# Answer verification is configured in YAML with policy.verify_answers.
 OPENAI_API_KEY=
 OPENAI_BASE_URL=
 COHERE_API_KEY=
@@ -327,6 +338,21 @@ and the accepted question to resolve references. Query-recovery variants are for
 Answers cite evidence with numbered markers such as `[1]` or `[1, 2]`. `citations` lists each cited
 passage once, numbered by first appearance. Markers that do not refer to verified evidence are
 removed. Setting `answers.inline_citations: false` removes all markers and returns no citations.
+
+With `policy.verify_answers` enabled, a draft with no letter or digit outside its markers, such as
+one holding only markers, punctuation or Markdown symbols, skips both judges. It cannot become a
+partial answer, and the policy moves to the next unused strategy. A short answer such as `No [E1].`
+still counts. The faithfulness judge receives a table of every marker in the draft, up to 32, with
+its position and claimed labels. It returns one assessment per marker. An answer passes only when
+every marker's labels all support the claim at that position and no material claim lacks a citation.
+Swapped, partly wrong or missing citations fail, and the single repair receives the same table to
+correct them. A draft with more than 32 markers, or more than 32 labels in one marker, is rejected
+without judging. `COMPLETE` also needs at least one named requirement, and every answered
+requirement must cite packed evidence. A judge that reports `COMPLETE` without that is treated as a
+provider error: an earlier verified partial is returned if one exists, otherwise the request fails
+with 503. The cited chunks become the answer's sources. Judge quality still limits how well this
+catches a wrong but plausible citation.
+
 Before delivery, MongoDB rechecks every packed passage from the selected answer, including
 uncited passages and the evidence inherited from history supplied to the detector or rewriter.
 If a passage is missing, loses eligibility, or changes its model-visible content,

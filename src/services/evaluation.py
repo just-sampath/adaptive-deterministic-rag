@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from pydantic import BaseModel
 
 from models.domain import (
+    AttributedFaithfulness,
+    AttributionStatus,
+    CitationAssessment,
+    CitationOccurrence,
     CompletenessEvaluation,
     CompletenessStatus,
     FaithfulnessEvaluation,
@@ -23,13 +27,18 @@ from models.domain import (
     RequirementEvaluation,
     RequirementStatus,
 )
+from services.citations import citation_occurrences
 from services.contracts import TextModel
 from utils.concurrency import run_pair
+from utils.errors import ProviderResponseError
 from utils.prompts import (
+    ATTRIBUTION_REPAIR_SYSTEM,
+    ATTRIBUTION_SYSTEM,
     COMPLETENESS_SYSTEM,
     FAITHFULNESS_SYSTEM,
     GENERATOR_SYSTEM,
     REPAIR_SYSTEM,
+    REQUIREMENTS_SYSTEM,
     evaluation_user_prompt,
     generation_user_prompt,
     repair_user_prompt,
@@ -94,16 +103,21 @@ class GenerationService:
         faithfulness: FaithfulnessEvaluation,
         completeness: CompletenessEvaluation,
     ) -> GenerationResult:
+        attributed = isinstance(faithfulness, AttributedFaithfulness)
         async with asyncio.timeout(self._timeout_seconds):
             result = await self._model.complete(
                 model=self._model_name,
-                system_prompt=REPAIR_SYSTEM,
+                system_prompt=ATTRIBUTION_REPAIR_SYSTEM if attributed else REPAIR_SYSTEM,
                 user_prompt=repair_user_prompt(
                     query=query,
                     previous_answer=previous_answer,
                     context=context,
                     faithfulness=faithfulness,
                     completeness=completeness,
+                    # The judged draft fit the table limit, so its occurrence IDs resolve here.
+                    previous_occurrences=citation_occurrences(previous_answer)
+                    if attributed
+                    else None,
                 ),
                 output_type=GenerationDraft,
                 max_output_tokens=self._max_output_tokens,
@@ -133,16 +147,34 @@ class OnlineEvaluator:
         query: QueryUnderstanding,
         answer: str,
         context: PackedContext,
+        occurrences: tuple[CitationOccurrence, ...] | None = None,
     ) -> EvaluationResult:
         prompt = evaluation_user_prompt(query, answer, context)
         faithful_result, complete_result = await run_pair(
-            self._judge(FAITHFULNESS_SYSTEM, prompt, FaithfulnessEvaluation),
-            self._judge(COMPLETENESS_SYSTEM, prompt, CompletenessEvaluation),
+            self._judge(
+                ATTRIBUTION_SYSTEM,
+                evaluation_user_prompt(query, answer, context, occurrences),
+                AttributedFaithfulness,
+            )
+            if occurrences is not None
+            else self._judge(FAITHFULNESS_SYSTEM, prompt, FaithfulnessEvaluation),
+            self._judge(
+                REQUIREMENTS_SYSTEM if occurrences is not None else COMPLETENESS_SYSTEM,
+                prompt,
+                CompletenessEvaluation,
+            ),
         )
         chunk_ids = {label: chunk.id for label, chunk in context.evidence_by_label().items()}
+        faithful = _sanitize_faithfulness(faithful_result.value, chunk_ids)
+        if occurrences is not None:
+            if not isinstance(faithful, AttributedFaithfulness):
+                raise ProviderResponseError("Faithfulness response lacks citation assessments")
+            faithful = _verify_attributions(faithful, occurrences, chunk_ids)
         return EvaluationResult(
-            faithfulness=_sanitize_faithfulness(faithful_result.value, chunk_ids),
-            completeness=_sanitize_completeness(complete_result.value, chunk_ids),
+            faithfulness=faithful,
+            completeness=_sanitize_completeness(
+                complete_result.value, chunk_ids, strict=occurrences is not None
+            ),
             usage=faithful_result.usage + complete_result.usage,
             model_calls=(
                 _model_call("faithfulness_evaluation", faithful_result),
@@ -207,11 +239,74 @@ def _sanitize_faithfulness(
     )
 
 
+def _verify_attributions(
+    verdict: AttributedFaithfulness,
+    occurrences: tuple[CitationOccurrence, ...],
+    chunk_ids: Mapping[str, str],
+) -> AttributedFaithfulness:
+    expected = {row.occurrence_id: row.claimed_labels for row in occurrences}
+    seen: set[int] = set()
+    valid = bool(expected) and not verdict.has_uncited_material_claims
+    safe_rows: list[CitationAssessment] = []
+    for assessment in verdict.occurrence_assessments:
+        ordinal = assessment.occurrence_id
+        if ordinal not in expected or ordinal in seen:
+            valid = False
+            continue
+        seen.add(ordinal)
+        # A label repeated inside one group, as in [E1, E1], claims that passage once.
+        claimed = tuple(dict.fromkeys(expected[ordinal]))
+        supported = assessment.supported_labels
+        # Only packed labels actually present at this location can enter a trace or repair prompt.
+        safe = tuple(
+            dict.fromkeys(label for label in supported if label in chunk_ids and label in claimed)
+        )
+        safe_rows.append(assessment.model_copy(update={"supported_labels": safe}))
+        if (
+            assessment.attribution_status is not AttributionStatus.SUPPORTED
+            or len(safe) != len(supported)
+            or len(safe) != len(claimed)
+            or set(safe) != set(claimed)
+        ):
+            valid = False
+    cited = _resolve((label for row in occurrences for label in row.claimed_labels), chunk_ids)
+    valid = valid and seen == expected.keys() and set(cited) <= set(verdict.verified_sources)
+    failure = verdict.failure_type
+    if verdict.passed and not valid:
+        failure = FaithfulnessStatus.UNSUPPORTED_CLAIMS
+    passed = failure is FaithfulnessStatus.SUPPORTED
+    return verdict.model_copy(
+        update={
+            "passed": passed,
+            "failure_type": failure,
+            "verified_sources": cited if passed else (),
+            "occurrence_assessments": tuple(safe_rows),
+        }
+    )
+
+
 def _sanitize_completeness(
     evaluation: CompletenessEvaluation,
     chunk_ids: Mapping[str, str],
+    *,
+    strict: bool = False,
 ) -> CompletenessEvaluation:
     requirements = tuple(_resolve_requirement(item, chunk_ids) for item in evaluation.requirements)
+    if (
+        strict
+        and evaluation.passed
+        and (
+            not requirements
+            or any(
+                not item.requirement.strip()
+                or (item.status is RequirementStatus.ANSWERED and not item.available_in_context)
+                for item in requirements
+            )
+        )
+    ):
+        raise ProviderResponseError(
+            "Complete verdict lacks a material requirement or valid supporting evidence"
+        )
     if evaluation.passed and not chunk_ids:
         return evaluation.model_copy(
             update={
@@ -239,6 +334,7 @@ def _resolve_requirement(
     requirement: RequirementEvaluation,
     chunk_ids: Mapping[str, str],
 ) -> RequirementEvaluation:
+    # Only labels that resolve to the packed evidence count as support.
     supporting = _resolve(requirement.supporting_chunks, chunk_ids)
     return requirement.model_copy(
         update={

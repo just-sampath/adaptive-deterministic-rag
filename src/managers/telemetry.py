@@ -39,9 +39,16 @@ class MongoTelemetrySink:
     async def write_traces(self, traces: Sequence[RequestTrace]) -> None:
         if traces:
             await self._traces.insert_many(
-                [trace.model_dump(mode="python", exclude=self._trace_exclude) for trace in traces],
+                [self._document(trace) for trace in traces],
                 ordered=False,
             )
+
+    def _document(self, trace: RequestTrace) -> dict[str, Any]:
+        document = trace.model_dump(mode="python", exclude=self._trace_exclude)
+        for attempt in document["attempts"]:
+            if attempt["outcome"] is None:
+                del attempt["outcome"]
+        return document
 
     @mongo_errors
     async def get_trace(self, request_id: str, tenant_id: str) -> RequestTrace | None:

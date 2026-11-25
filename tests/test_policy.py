@@ -10,6 +10,8 @@ from handlers.search_strategies.query_recovery import QueryRecoveryStrategy
 from handlers.search_strategies.recall_expansion import RecallExpansionStrategy
 from handlers.search_strategies.registry import SearchStrategyRegistry, build_strategy_registry
 from models.domain import (
+    AttemptOutcome,
+    AttributedFaithfulness,
     Chunk,
     CompletenessEvaluation,
     CompletenessStatus,
@@ -712,3 +714,101 @@ def test_generation_repair_is_global_and_bounded() -> None:
     assert policy.can_repair(state, result)
     state.generation_repairs_used = 1
     assert not policy.can_repair(state, result)
+
+
+def _attributed(result: EvaluationResult) -> EvaluationResult:
+    faithfulness = AttributedFaithfulness(
+        **result.faithfulness.model_dump(),
+        occurrence_assessments=(),
+        has_uncited_material_claims=False,
+    )
+    return EvaluationResult(
+        faithfulness=faithfulness, completeness=result.completeness, usage=ModelUsage()
+    )
+
+
+@pytest.mark.parametrize(
+    "requirements",
+    [
+        (requirement("definition", answered=True), requirement("  ")),
+        (requirement("definition", answered=True, available=False), requirement("limitations")),
+        (requirement("definition", answered=True),),
+    ],
+    ids=["blank-requirement", "answered-without-support", "nothing-missing"],
+)
+def test_verified_partial_needs_supported_answers_and_a_real_missing_requirement(
+    requirements: tuple[RequirementEvaluation, ...],
+) -> None:
+    state = make_state()
+    result = partial_result(*requirements)
+    # The legacy verdict is still eligible; the attributed one applies the stricter rule.
+    preserve(state, result, "Supported definition [E1].")
+    assert state.best_verified_answer is not None
+
+    state = make_state()
+    preserve(state, _attributed(result), "Supported definition [E1].")
+
+    assert state.best_verified_answer is None
+
+
+def test_attributed_partial_with_a_supported_answer_and_a_missing_requirement_is_kept() -> None:
+    state = make_state()
+    result = _attributed(
+        partial_result(requirement("definition", answered=True), requirement("limitations"))
+    )
+
+    preserve(state, result, "Supported definition [E1].")
+
+    assert state.best_verified_answer is not None
+    assert state.best_verified_answer.unanswered_requirements == ("limitations",)
+
+
+@pytest.mark.parametrize("outcome", [AttemptOutcome.EMPTY_DRAFT, AttemptOutcome.CITATION_LIMIT])
+def test_rejected_draft_follows_the_unclassified_order_and_budget(
+    outcome: AttemptOutcome,
+) -> None:
+    policy = DecisionPolicy(policy=PolicyConfig(), retrieval=RetrievalConfig())
+
+    def next_after(*attempted: RetrievalStrategy, facts: tuple[str, ...] = ()) -> RetryDecision:
+        return policy.decide_next(
+            make_state(attempted=attempted, facts=facts),
+            outcome,
+            conversation_facts_used=False,
+            evidence_available=True,
+        )
+
+    assert next_after(HAPPY).hypothesis is RetryHypothesis.UNCLASSIFIED
+    assert next_after(HAPPY).next_strategy is RECALL
+    assert next_after(HAPPY, RECALL).next_strategy is RECOVERY
+    assert next_after(HAPPY, RECALL, RECOVERY).next_strategy is None
+    assert next_after(HAPPY, RECALL, RECOVERY, facts=(FACT,)).next_strategy is ISOLATION
+    assert DecisionPolicy.failures(outcome, decision=next_after(HAPPY), passed=False) == ()
+
+
+@pytest.mark.parametrize("literal", [CANONICAL, DRIFTED_LITERAL], ids=["unchanged", "drifted"])
+def test_empty_evidence_outcome_matches_the_synthesized_no_evidence_verdict(literal: str) -> None:
+    policy = DecisionPolicy(policy=PolicyConfig(), retrieval=RetrievalConfig())
+    legacy = EvaluationResult(
+        faithfulness=FaithfulnessEvaluation(passed=False, failure_type=NO_MATERIAL, confidence=1),
+        completeness=CompletenessEvaluation(
+            passed=False,
+            failure_type=MISSING_EVIDENCE,
+            requirements=(requirement(literal, available=False),),
+            confidence=1,
+        ),
+        usage=ModelUsage(),
+    )
+    decisions = [
+        policy.decide_next(
+            make_state(literal=literal),
+            item,
+            conversation_facts_used=False,
+            evidence_available=False,
+        )
+        for item in (legacy, AttemptOutcome.EMPTY_EVIDENCE)
+    ]
+
+    assert decisions[0] == decisions[1]
+    assert DecisionPolicy.failures(
+        legacy, decision=decisions[0], passed=False
+    ) == DecisionPolicy.failures(AttemptOutcome.EMPTY_EVIDENCE, decision=decisions[1], passed=False)

@@ -10,6 +10,7 @@ import pytest
 from openai._utils import _logs
 
 from models.domain import (
+    AttemptOutcome,
     AttemptTrace,
     CompletenessEvaluation,
     CompletenessStatus,
@@ -144,6 +145,7 @@ def test_projection_removes_every_free_text_field(mode: ContentMode) -> None:
         service.redact_text("what is the secret plan"),
         service.redact_text("secret keyword"),
     )
+    assert attempt.faithfulness and attempt.completeness
     assert attempt.faithfulness.unsupported_claims[0].claim == service.redact_text(
         "unsupported secret"
     )
@@ -272,3 +274,25 @@ def test_configure_logging_mutes_the_installed_httpcore2_transport_loggers(
 
     assert transport_logger.name.partition(".")[0] in _PAYLOAD_LOGGERS
     assert transport_logger.getEffectiveLevel() == logging.WARNING
+
+
+@pytest.mark.parametrize(
+    "mode", [ContentMode.FULL, ContentMode.REDACTED, ContentMode.METADATA_ONLY]
+)
+def test_projection_keeps_an_unevaluated_attempt_without_verdicts(mode: ContentMode) -> None:
+    attempt = AttemptTrace.model_validate(
+        {
+            **make_attempt().model_dump(),
+            "outcome": AttemptOutcome.EMPTY_DRAFT,
+            "faithfulness": None,
+            "completeness": None,
+        }
+    )
+    trace = make_trace().model_copy(update={"attempts": (attempt,)})
+
+    (projected,) = make_service(mode).project_trace(trace).attempts
+
+    assert projected.outcome is AttemptOutcome.EMPTY_DRAFT
+    assert projected.faithfulness is None and projected.completeness is None
+    if mode is not ContentMode.FULL:
+        assert "secret" not in projected.model_dump_json()

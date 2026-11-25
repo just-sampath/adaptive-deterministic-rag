@@ -198,6 +198,7 @@ class ContextConfig(ConfigModel):
 
 
 class PolicyConfig(ConfigModel):
+    verify_answers: bool = Field(default=False, strict=True)
     max_generation_repairs: int = Field(default=1, ge=0, le=1)
     max_strategies: int = Field(default=4, ge=1, le=4)
     allow_verified_partial: bool = True

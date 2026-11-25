@@ -10,6 +10,7 @@ from openai import AsyncOpenAI, Omit
 from pydantic import BaseModel
 
 from models.domain import (
+    AttributedFaithfulness,
     CompletenessEvaluation,
     ContextualizationOutput,
     FaithfulnessEvaluation,
@@ -24,6 +25,7 @@ from utils.errors import ProviderResponseError
 _OUTPUT_TYPES: tuple[type[BaseModel], ...] = (
     GenerationDraft,
     FaithfulnessEvaluation,
+    AttributedFaithfulness,
     CompletenessEvaluation,
     ContextualizationOutput,
     QueryRecoveryOutput,
@@ -97,6 +99,24 @@ async def test_reply_text_is_validated_as_the_requested_schema() -> None:
     model, _ = _model(_reply('{"answer": "Advantages."}'))
 
     assert await _complete(model) == GenerationDraft(answer="Advantages.")
+
+
+async def test_fresh_attribution_response_requires_assessments_even_for_legacy_shaped_json() -> (
+    None
+):
+    historical = (
+        '{"passed":true,"failure_type":"SUPPORTED","confidence":1,"verified_sources":["E1"]}'
+    )
+    assert FaithfulnessEvaluation.model_validate_json(historical).passed
+    model, _ = _model(_reply(historical))
+    with pytest.raises(ProviderResponseError):
+        await model.complete(
+            model="test",
+            system_prompt="judge",
+            user_prompt="draft",
+            output_type=AttributedFaithfulness,
+            max_output_tokens=128,
+        )
 
 
 @pytest.mark.parametrize(

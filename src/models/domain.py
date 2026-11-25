@@ -330,11 +330,50 @@ class FaithfulnessEvaluation(FrozenModel):
         return _passed_from_status(data, FaithfulnessStatus.SUPPORTED)
 
 
+# The same wire limit applies to the occurrence table, judge rows and grouped labels.
+MAX_CITATION_OCCURRENCES = 32
+
+
+class CitationOccurrence(FrozenModel):
+    occurrence_id: int
+    start: int
+    end: int
+    claimed_labels: tuple[str, ...]
+
+
+class AttributionStatus(StrEnum):
+    SUPPORTED = "supported"
+    UNSUPPORTED = "unsupported"
+    CONTRADICTED = "contradicted"
+
+
+class CitationAssessment(FrozenModel):
+    occurrence_id: int = Field(ge=1)
+    supported_labels: tuple[str, ...] = Field(max_length=MAX_CITATION_OCCURRENCES)
+    attribution_status: AttributionStatus
+
+
+# Fresh attribution responses require both fields; historical verdicts use the base model.
+# A comment, not a docstring, so the note is not sent to the judge as the schema description.
+class AttributedFaithfulness(FaithfulnessEvaluation):
+    occurrence_assessments: tuple[CitationAssessment, ...] = Field(
+        max_length=MAX_CITATION_OCCURRENCES
+    )
+    has_uncited_material_claims: bool
+
+
 class RequirementEvaluation(FrozenModel):
     requirement: str
     status: RequirementStatus
     available_in_context: bool = False
     supporting_chunks: tuple[str, ...] = ()
+
+
+class AttemptOutcome(StrEnum):
+    EVALUATED = "evaluated"
+    EMPTY_EVIDENCE = "empty_evidence"
+    EMPTY_DRAFT = "empty_draft"
+    CITATION_LIMIT = "citation_limit"
 
 
 class CompletenessEvaluation(FrozenModel):
@@ -486,8 +525,9 @@ class AttemptTrace(FrozenModel):
     fused_result_count: int
     candidates: tuple[CandidateTrace, ...]
     packed_chunk_ids: tuple[str, ...]
-    faithfulness: FaithfulnessEvaluation
-    completeness: CompletenessEvaluation
+    outcome: AttemptOutcome | None = None
+    faithfulness: AttributedFaithfulness | FaithfulnessEvaluation | None
+    completeness: CompletenessEvaluation | None
     failure_types: tuple[RagFailure, ...]
     generation_repair_attempted: bool
     latency_ms: float
@@ -495,6 +535,20 @@ class AttemptTrace(FrozenModel):
     model_calls: tuple[ModelCallTrace, ...] = ()
     answer_observation: dict[str, Any]
     decision: RetryDecision | None = None
+
+    @model_validator(mode="after")
+    def check_verdicts(self) -> AttemptTrace:
+        evaluated_or_legacy = self.outcome in (None, AttemptOutcome.EVALUATED)
+        if (self.faithfulness is not None) != evaluated_or_legacy or (
+            self.completeness is not None
+        ) != evaluated_or_legacy:
+            raise ValueError("Attempt verdicts must match the recorded outcome")
+        if evaluated_or_legacy and (
+            isinstance(self.faithfulness, AttributedFaithfulness)
+            != (self.outcome is AttemptOutcome.EVALUATED)
+        ):
+            raise ValueError("Evaluated attempts require citation assessments")
+        return self
 
 
 class RewriteDecision(StrEnum):

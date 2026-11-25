@@ -12,6 +12,7 @@ from handlers.policy import DecisionPolicy, TerminalResult
 from handlers.search_strategies.contracts import StrategyPlan
 from handlers.search_strategies.registry import SearchStrategyRegistry
 from models.domain import (
+    AttemptOutcome,
     AttemptTrace,
     CandidateTrace,
     Chunk,
@@ -38,7 +39,13 @@ from models.domain import (
     Source,
     VerifiedAnswer,
 )
-from services.citations import CitationRenderer, RenderedAnswer, sources_from_chunks
+from services.citations import (
+    CitationRenderer,
+    RenderedAnswer,
+    citation_occurrences,
+    has_material_text,
+    sources_from_chunks,
+)
 from services.context import ContextBuilder, ContextOutcome
 from services.contracts import ConversationStore, DocumentReader
 from services.evaluation import (
@@ -52,7 +59,7 @@ from services.retrieval import RetrievalOutcome, StrategyRetriever
 from services.telemetry import TelemetryService
 from services.understanding import QueryUnderstandingService
 from utils.errors import InfrastructureError, RequestDeadlineExceededError
-from utils.prompts import PROMPT_VERSIONS, STANDARD_ABSTENTION
+from utils.prompts import PROMPT_VERSIONS, STANDARD_ABSTENTION, VERIFICATION_PROMPT_VERSIONS
 from utils.request_context import current_request_id
 from utils.settings import ContextualizationConfig, PolicyConfig, RetrievalConfig, TimeoutConfig
 
@@ -383,7 +390,7 @@ class SearchHandler:
         *,
         reused: bool,
         started: float,
-    ) -> TerminalResult | EvaluationResult:
+    ) -> TerminalResult | EvaluationResult | AttemptOutcome:
         generation, evaluation = await self._generate_and_evaluate(state, plan, evidence)
         self._record_attempt(
             state=state,
@@ -395,7 +402,7 @@ class SearchHandler:
             retrieval_reused=reused,
             latency_ms=_elapsed_ms(started),
         )
-        if generation is None:
+        if generation is None or isinstance(evaluation, AttemptOutcome):
             return evaluation
         if self._decision.passed(evaluation):
             return _complete(
@@ -419,7 +426,7 @@ class SearchHandler:
         evidence: _Evidence,
         generation: GenerationResult,
         evaluation: EvaluationResult,
-    ) -> TerminalResult | EvaluationResult:
+    ) -> TerminalResult | EvaluationResult | AttemptOutcome:
         started = perf_counter()
         state.generation_repairs_used += 1
         packed = evidence.context.packed_context
@@ -430,11 +437,7 @@ class SearchHandler:
             faithfulness=evaluation.faithfulness,
             completeness=evaluation.completeness,
         )
-        repaired_evaluation = await self._evaluator.evaluate(
-            query=state.query,
-            answer=repaired.draft.answer,
-            context=packed,
-        )
+        repaired_evaluation = await self._evaluate_draft(state, evidence, repaired)
         self._record_attempt(
             state=state,
             strategy=plan.kind,
@@ -445,13 +448,17 @@ class SearchHandler:
             retrieval_reused=True,
             latency_ms=_elapsed_ms(started),
         )
-        passed = self._decision.passed(repaired_evaluation)
+        passed = isinstance(repaired_evaluation, EvaluationResult) and self._decision.passed(
+            repaired_evaluation
+        )
         self._emit(
             state.request_id,
             state.identity,
             "rag.repair.completed",
             attributes={"successful": passed, "strategy": plan.kind.value},
         )
+        if isinstance(repaired_evaluation, AttemptOutcome):
+            return repaired_evaluation
         self._keep_best(
             state, plan.kind, repaired.draft.answer, repaired_evaluation, evidence, repaired=True
         )
@@ -470,8 +477,10 @@ class SearchHandler:
         state: RagState,
         plan: StrategyPlan,
         evidence: _Evidence,
-    ) -> tuple[GenerationResult | None, EvaluationResult]:
+    ) -> tuple[GenerationResult | None, EvaluationResult | AttemptOutcome]:
         if not evidence.available:
+            if self._policy.verify_answers:
+                return None, AttemptOutcome.EMPTY_EVIDENCE
             return None, self._empty_evaluation(state.query.literal_question)
         packed = evidence.context.packed_context
         generation = await self._generator.generate(
@@ -479,12 +488,24 @@ class SearchHandler:
             context=packed,
             conversation_facts=_conversation_facts(state, plan),
         )
-        evaluation = await self._evaluator.evaluate(
+        return generation, await self._evaluate_draft(state, evidence, generation)
+
+    async def _evaluate_draft(
+        self, state: RagState, evidence: _Evidence, generation: GenerationResult
+    ) -> EvaluationResult | AttemptOutcome:
+        occurrences = None
+        if self._policy.verify_answers:
+            if not has_material_text(generation.draft.answer):
+                return AttemptOutcome.EMPTY_DRAFT
+            occurrences = citation_occurrences(generation.draft.answer)
+            if occurrences is None:
+                return AttemptOutcome.CITATION_LIMIT
+        return await self._evaluator.evaluate(
             query=state.query,
             answer=generation.draft.answer,
-            context=packed,
+            context=evidence.context.packed_context,
+            occurrences=occurrences,
         )
-        return generation, evaluation
 
     def _record_attempt(
         self,
@@ -493,7 +514,7 @@ class SearchHandler:
         strategy: RetrievalStrategy,
         evidence: _Evidence,
         generation: GenerationResult | None,
-        evaluation: EvaluationResult,
+        evaluation: EvaluationResult | AttemptOutcome,
         repaired: bool,
         retrieval_reused: bool,
         latency_ms: float,
@@ -518,8 +539,9 @@ class SearchHandler:
             )
             for item in retrieval.ranked_chunks
         )
-        usage = evaluation.usage
-        model_calls = evaluation.model_calls
+        verdict = evaluation if isinstance(evaluation, EvaluationResult) else None
+        usage = verdict.usage if verdict else ModelUsage()
+        model_calls = verdict.model_calls if verdict else ()
         if not retrieval_reused:
             usage += retrieval.embedding_usage + retrieval.query_recovery_usage
             model_calls = retrieval.model_calls + model_calls
@@ -538,8 +560,11 @@ class SearchHandler:
                 fused_result_count=retrieval.fused_result_count,
                 candidates=candidates,
                 packed_chunk_ids=tuple(item.chunk.id for item in context.packed_context.chunks),
-                faithfulness=evaluation.faithfulness,
-                completeness=evaluation.completeness,
+                outcome=evaluation
+                if isinstance(evaluation, AttemptOutcome)
+                else (AttemptOutcome.EVALUATED if self._policy.verify_answers else None),
+                faithfulness=verdict.faithfulness if verdict else None,
+                completeness=verdict.completeness if verdict else None,
                 failure_types=(),
                 generation_repair_attempted=repaired,
                 latency_ms=latency_ms,
@@ -558,8 +583,8 @@ class SearchHandler:
                 "strategy": strategy.value,
                 "repaired": repaired,
                 "latency_ms": round(latency_ms, 3),
-                "faithful": evaluation.faithfulness.passed,
-                "complete": evaluation.completeness.passed,
+                "faithful": verdict.faithfulness.passed if verdict else None,
+                "complete": verdict.completeness.passed if verdict else None,
             },
         )
 
@@ -568,7 +593,7 @@ class SearchHandler:
         state: RagState,
         plan: StrategyPlan,
         evidence: _Evidence,
-        evaluation: EvaluationResult,
+        evaluation: EvaluationResult | AttemptOutcome,
     ) -> RetryDecision:
         decision = self._decision.decide_next(
             state,
@@ -650,7 +675,9 @@ class SearchHandler:
             token_usage=token_usage,
             model_calls=record.contextualization_calls
             + tuple(call for attempt in attempts for call in attempt.model_calls),
-            prompt_versions=PROMPT_VERSIONS,
+            prompt_versions=VERIFICATION_PROMPT_VERSIONS
+            if self._policy.verify_answers
+            else PROMPT_VERSIONS,
             runtime_versions=self._runtime_versions,
             configuration_fingerprint=self._configuration_fingerprint,
             error_code=record.error_code,

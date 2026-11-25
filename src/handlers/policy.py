@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from models.domain import (
+    AttemptOutcome,
+    AttributedFaithfulness,
     CompletenessStatus,
     EvidenceRef,
     FaithfulnessStatus,
@@ -105,18 +107,25 @@ class DecisionPolicy:
     def decide_next(
         self,
         state: RagState,
-        evaluation: EvaluationResult,
+        evaluation: EvaluationResult | AttemptOutcome,
         *,
         conversation_facts_used: bool,
         evidence_available: bool,
     ) -> RetryDecision:
         drift = query_drift_score(state.query.literal_question, state.query.canonical_question)
-        hypothesis = _classify(
-            evaluation,
-            drift_high=drift_reaches_threshold(drift, self._retrieval.query_drift_threshold),
-            conversation_facts_used=conversation_facts_used,
-            evidence_available=evidence_available,
-        )
+        drift_high = drift_reaches_threshold(drift, self._retrieval.query_drift_threshold)
+        if isinstance(evaluation, EvaluationResult):
+            hypothesis = _classify(
+                evaluation,
+                drift_high=drift_high,
+                conversation_facts_used=conversation_facts_used,
+                evidence_available=evidence_available,
+            )
+        elif evaluation is AttemptOutcome.EMPTY_EVIDENCE:
+            # The classification the synthesized no-evidence verdict received before verification.
+            hypothesis = RetryHypothesis.QUERY_DRIFT if drift_high else RetryHypothesis.LOW_RECALL
+        else:
+            hypothesis = RetryHypothesis.UNCLASSIFIED
         strategy = self._next_strategy(state, hypothesis)
         return RetryDecision(
             hypothesis=hypothesis,
@@ -144,13 +153,18 @@ class DecisionPolicy:
 
     @staticmethod
     def failures(
-        evaluation: EvaluationResult,
+        evaluation: EvaluationResult | AttemptOutcome,
         *,
         decision: RetryDecision | None,
         passed: bool,
     ) -> tuple[RagFailure, ...]:
         if passed:
             return ()
+        if isinstance(evaluation, AttemptOutcome):
+            if evaluation is not AttemptOutcome.EMPTY_EVIDENCE:
+                return ()
+            inferred = _decision_failure(decision)
+            return tuple(dict.fromkeys((RagFailure.LOW_RECALL, *((inferred,) if inferred else ()))))
         unsupported = evaluation.faithfulness.failure_type in _UNSUPPORTED
         candidates = (
             _COMPLETENESS_FAILURES.get(evaluation.completeness.failure_type),
@@ -172,6 +186,15 @@ class DecisionPolicy:
         faithfulness = evaluation.faithfulness
         requirements = evaluation.completeness.requirements
         if not faithfulness.passed or not faithfulness.verified_sources:
+            return
+        if isinstance(faithfulness, AttributedFaithfulness) and (
+            any(
+                not item.requirement.strip()
+                or (item.status is RequirementStatus.ANSWERED and not item.available_in_context)
+                for item in requirements
+            )
+            or not any(item.status is RequirementStatus.MISSING for item in requirements)
+        ):
             return
         answered = sum(item.status is RequirementStatus.ANSWERED for item in requirements)
         if answered == 0:

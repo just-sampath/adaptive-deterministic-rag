@@ -9,3 +9,6 @@ contextualization:
 telemetry:
   queue_capacity: 500
   batch_size: 25
+
+policy:
+  verify_answers: true
