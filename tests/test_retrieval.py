@@ -285,11 +285,11 @@ async def test_decomposed_queries_have_their_own_budget() -> None:
             id="resolved-reference-is-dropped",
         ),
         pytest.param(
-            "What about product A pricing?",
-            "Explain product B migration limitations",
+            "What about product A pricing and migration?",
+            "Explain product A pricing",
             (
-                "Explain product B migration limitations",
-                "What about product A pricing?",
+                "Explain product A pricing",
+                "What about product A pricing and migration?",
                 "keywords",
                 "first",
             ),

@@ -18,9 +18,15 @@ class MongoTelemetrySink:
         *,
         trace_collection: str,
         event_collection: str,
+        write_query_intent_fields: bool = False,
     ) -> None:
         self._traces = database[trace_collection]
         self._events = database[event_collection]
+        self._trace_exclude = (
+            None
+            if write_query_intent_fields
+            else {"contextualization": {"proposed_drift_score", "rewrite_decision"}}
+        )
 
     @mongo_errors
     async def write_events(self, events: Sequence[TelemetryEvent]) -> None:
@@ -33,7 +39,8 @@ class MongoTelemetrySink:
     async def write_traces(self, traces: Sequence[RequestTrace]) -> None:
         if traces:
             await self._traces.insert_many(
-                [trace.model_dump(mode="python") for trace in traces], ordered=False
+                [trace.model_dump(mode="python", exclude=self._trace_exclude) for trace in traces],
+                ordered=False,
             )
 
     @mongo_errors

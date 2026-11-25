@@ -5,20 +5,32 @@ import json
 import logging
 from collections.abc import Sequence
 from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import create_autospec
 
 import httpx
 import pytest
+from bson import BSON
 from fastapi import FastAPI
+from pymongo.asynchronous.collection import AsyncCollection
+from pymongo.asynchronous.database import AsyncDatabase
 
+from managers.telemetry import MongoTelemetrySink
 from middleware.request_telemetry import RequestTelemetryMiddleware
-from models.domain import ModelUsage, RequestTrace, TelemetryEvent
+from models.domain import (
+    ContextualizationTrace,
+    ModelUsage,
+    RequestTrace,
+    RewriteDecision,
+    TelemetryEvent,
+)
 from routes.dependencies import RequestIdentity
 from services.telemetry import TelemetryService
 from tests.fakes import FakeRepository
 from utils.errors import InfrastructureError
 from utils.logging import JsonFormatter
 from utils.request_context import current_request_id
-from utils.settings import Environment, ExternalSettings, Settings, TelemetryConfig
+from utils.settings import ContentMode, Environment, ExternalSettings, Settings, TelemetryConfig
 
 _HASH_KEY = b"test-telemetry-key"
 
@@ -73,6 +85,80 @@ def make_trace(request_id: str) -> RequestTrace:
         runtime_versions={},
         configuration_fingerprint="test",
     )
+
+
+def rejected_rewrite_trace() -> RequestTrace:
+    context = ContextualizationTrace(
+        enabled=True,
+        detector="model",
+        history_messages=2,
+        selected_messages=1,
+        proposed_drift_score=0.25,
+        rewrite_decision=RewriteDecision.REJECTED_ANCHOR,
+    )
+    return make_trace("rewrite").model_copy(update={"contextualization": context})
+
+
+@pytest.mark.parametrize("enriched", [False, True], ids=["legacy", "enriched"])
+async def test_mongo_trace_layout_and_read_after_disabling_writes(enriched: bool) -> None:
+    collection = create_autospec(AsyncCollection, instance=True)
+    database = cast(AsyncDatabase[dict[str, Any]], {"traces": collection, "events": None})
+    reader = MongoTelemetrySink(database, trace_collection="traces", event_collection="events")
+    writer = reader
+    if enriched:
+        writer = MongoTelemetrySink(
+            database,
+            trace_collection="traces",
+            event_collection="events",
+            write_query_intent_fields=True,
+        )
+
+    await writer.write_traces([rejected_rewrite_trace()])
+
+    document = BSON(BSON.encode(collection.insert_many.await_args.args[0][0])).decode()
+    expected = {
+        "enabled": True,
+        "detector": "model",
+        "followup_probability": None,
+        "fail_open": False,
+        "history_messages": 2,
+        "selected_messages": 1,
+        "rewritten": False,
+    }
+    if enriched:
+        expected.update(proposed_drift_score=0.25, rewrite_decision="rejected_anchor")
+    assert document["contextualization"] == expected
+    collection.find_one.return_value = document
+    trace = await reader.get_trace("rewrite", "tenant")
+    assert trace is not None and trace.contextualization is not None
+    assert trace.contextualization.proposed_drift_score == (0.25 if enriched else None)
+    assert trace.contextualization.rewrite_decision == ("rejected_anchor" if enriched else None)
+
+
+@pytest.mark.parametrize("enriched", [False, True], ids=["legacy", "enriched"])
+@pytest.mark.parametrize(
+    "mode", [ContentMode.FULL, ContentMode.REDACTED, ContentMode.METADATA_ONLY]
+)
+async def test_pending_trace_exposes_the_configured_query_intent_fields(
+    enriched: bool, mode: ContentMode
+) -> None:
+    service = TelemetryService(
+        FakeRepository(),
+        TelemetryConfig(content_mode=mode, write_query_intent_fields=enriched),
+        hash_key=_HASH_KEY,
+    )
+    await service.start()
+    try:
+        await service.save_trace(rejected_rewrite_trace())
+        pending = await service.get_trace("rewrite", "tenant")
+    finally:
+        await service.close()
+
+    assert pending is not None and pending.contextualization is not None
+    assert pending.contextualization.history_messages == 2
+    assert pending.contextualization.proposed_drift_score == (0.25 if enriched else None)
+    assert pending.contextualization.rewrite_decision == ("rejected_anchor" if enriched else None)
+    assert await service.get_trace("rewrite", "tenant") == pending
 
 
 def log_field(record: logging.LogRecord, name: str) -> object:

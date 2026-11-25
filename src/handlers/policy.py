@@ -20,7 +20,7 @@ from models.domain import (
     VerifiedAnswer,
 )
 from services.evaluation import EvaluationResult
-from services.understanding import query_drift_score
+from services.understanding import drift_reaches_threshold, query_drift_score
 from utils.settings import PolicyConfig, RetrievalConfig
 
 _UNSUPPORTED = frozenset(
@@ -113,7 +113,7 @@ class DecisionPolicy:
         drift = query_drift_score(state.query.literal_question, state.query.canonical_question)
         hypothesis = _classify(
             evaluation,
-            drift_high=drift >= self._retrieval.query_drift_threshold,
+            drift_high=drift_reaches_threshold(drift, self._retrieval.query_drift_threshold),
             conversation_facts_used=conversation_facts_used,
             evidence_available=evidence_available,
         )
@@ -258,4 +258,4 @@ def _unanswered(
     missing = tuple(
         item.requirement for item in requirements if item.status is RequirementStatus.MISSING
     )
-    return missing or (state.query.canonical_question,)
+    return missing or (state.query.literal_question,)

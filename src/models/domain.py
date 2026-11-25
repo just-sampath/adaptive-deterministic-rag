@@ -497,6 +497,14 @@ class AttemptTrace(FrozenModel):
     decision: RetryDecision | None = None
 
 
+class RewriteDecision(StrEnum):
+    UNCHANGED = "unchanged"
+    EMPTY = "empty"
+    ACCEPTED = "accepted"
+    REJECTED_DRIFT = "rejected_drift"
+    REJECTED_ANCHOR = "rejected_anchor"
+
+
 class ContextualizationTrace(FrozenModel):
     enabled: bool
     detector: str | None = None
@@ -505,6 +513,8 @@ class ContextualizationTrace(FrozenModel):
     history_messages: int = Field(default=0, ge=0)
     selected_messages: int = Field(default=0, ge=0)
     rewritten: bool = False
+    proposed_drift_score: float | None = Field(default=None, ge=0, le=1)
+    rewrite_decision: RewriteDecision | None = None
 
 
 class RequestTrace(FrozenModel):

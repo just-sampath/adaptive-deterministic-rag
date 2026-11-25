@@ -40,6 +40,7 @@ from utils.prompts import (
 from utils.settings import Settings, load_settings
 
 _QUESTION = "How long are request traces kept?"
+_FOLLOWUP = "and how long?"
 _ANSWER = "Request traces are kept for 30 days [E1]."
 _HISTORY = ("user: Where are request traces stored?", "assistant: In MongoDB.")
 
@@ -75,7 +76,7 @@ def _checks(settings: Settings, text_model: OpenAITextModel) -> list[_Check]:
     ai = settings.ai
     context = _context()
     understanding = QueryUnderstanding(
-        literal_question=_QUESTION, canonical_question=_QUESTION, rewritten=False
+        literal_question=_FOLLOWUP, canonical_question=_QUESTION, rewritten=True
     )
 
     def structured(
@@ -102,14 +103,14 @@ def _checks(settings: Settings, text_model: OpenAITextModel) -> list[_Check]:
             "follow-up detection",
             settings.contextualization.detector_model,
             FOLLOWUP_DETECTOR_SYSTEM,
-            followup_detection_user_prompt("and how long?", _HISTORY),
+            followup_detection_user_prompt(_FOLLOWUP, _HISTORY),
             FollowupClassification,
         ),
         structured(
             "contextualization",
             ai.contextualization_model,
             CONTEXTUALIZER_SYSTEM,
-            contextualization_user_prompt("and how long?", _HISTORY),
+            contextualization_user_prompt(_FOLLOWUP, _HISTORY),
             ContextualizationOutput,
         ),
         structured(
@@ -123,21 +124,21 @@ def _checks(settings: Settings, text_model: OpenAITextModel) -> list[_Check]:
             "generation",
             ai.generation_model,
             GENERATOR_SYSTEM,
-            generation_user_prompt(_QUESTION, context, ()),
+            generation_user_prompt(understanding, context, ()),
             GenerationDraft,
         ),
         structured(
             "faithfulness evaluation",
             ai.evaluation_model,
             FAITHFULNESS_SYSTEM,
-            evaluation_user_prompt(_QUESTION, _ANSWER, context),
+            evaluation_user_prompt(understanding, _ANSWER, context),
             FaithfulnessEvaluation,
         ),
         structured(
             "completeness evaluation",
             ai.evaluation_model,
             COMPLETENESS_SYSTEM,
-            evaluation_user_prompt(_QUESTION, _ANSWER, context),
+            evaluation_user_prompt(understanding, _ANSWER, context),
             CompletenessEvaluation,
         ),
     ]

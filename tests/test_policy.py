@@ -191,6 +191,30 @@ def test_no_supported_material_with_evidence_is_query_drift() -> None:
     assert decision.next_strategy is RECOVERY
 
 
+@pytest.mark.parametrize(
+    ("faithfulness", "expected"),
+    [
+        (FaithfulnessStatus.SUPPORTED, RetryHypothesis.GENERATION_ONLY),
+        (NO_MATERIAL, RetryHypothesis.QUERY_DRIFT),
+    ],
+)
+def test_zero_threshold_requires_positive_loss_or_independent_evidence_for_drift(
+    faithfulness: FaithfulnessStatus, expected: RetryHypothesis
+) -> None:
+    policy = DecisionPolicy(
+        policy=PolicyConfig(), retrieval=RetrievalConfig(query_drift_threshold=0)
+    )
+    decision = policy.decide_next(
+        make_state(),
+        evaluation(faithfulness=faithfulness),
+        conversation_facts_used=False,
+        evidence_available=True,
+    )
+
+    assert decision.drift_score == 0
+    assert decision.hypothesis is expected
+
+
 def test_unavailable_requirements_in_multi_part_question_are_query_drift() -> None:
     requirements = (
         requirement("limitations", answered=True),
@@ -647,14 +671,14 @@ def test_fewer_answered_requirements_never_displace_a_better_answer() -> None:
     assert best.answer == "broad"
 
 
-def test_missing_gap_list_defaults_to_the_canonical_question() -> None:
-    state = make_state()
+def test_missing_gap_list_discloses_the_literal_question() -> None:
+    state = make_state(literal="What about its migration limitations?")
 
     preserve(state, partial_result(requirement("definition", answered=True)), "answer")
 
     best = state.best_verified_answer
     assert best is not None
-    assert best.unanswered_requirements == (CANONICAL,)
+    assert best.unanswered_requirements == ("What about its migration limitations?",)
 
 
 @pytest.mark.parametrize(

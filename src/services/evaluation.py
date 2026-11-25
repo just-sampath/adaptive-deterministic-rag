@@ -19,6 +19,7 @@ from models.domain import (
     ModelResult,
     ModelUsage,
     PackedContext,
+    QueryUnderstanding,
     RequirementEvaluation,
     RequirementStatus,
 )
@@ -70,7 +71,7 @@ class GenerationService:
     async def generate(
         self,
         *,
-        question: str,
+        query: QueryUnderstanding,
         context: PackedContext,
         conversation_facts: Sequence[str],
     ) -> GenerationResult:
@@ -78,7 +79,7 @@ class GenerationService:
             result = await self._model.complete(
                 model=self._model_name,
                 system_prompt=GENERATOR_SYSTEM,
-                user_prompt=generation_user_prompt(question, context, conversation_facts),
+                user_prompt=generation_user_prompt(query, context, conversation_facts),
                 output_type=GenerationDraft,
                 max_output_tokens=self._max_output_tokens,
             )
@@ -87,7 +88,7 @@ class GenerationService:
     async def repair(
         self,
         *,
-        question: str,
+        query: QueryUnderstanding,
         previous_answer: str,
         context: PackedContext,
         faithfulness: FaithfulnessEvaluation,
@@ -98,7 +99,7 @@ class GenerationService:
                 model=self._model_name,
                 system_prompt=REPAIR_SYSTEM,
                 user_prompt=repair_user_prompt(
-                    question=question,
+                    query=query,
                     previous_answer=previous_answer,
                     context=context,
                     faithfulness=faithfulness,
@@ -129,11 +130,11 @@ class OnlineEvaluator:
     async def evaluate(
         self,
         *,
-        question: str,
+        query: QueryUnderstanding,
         answer: str,
         context: PackedContext,
     ) -> EvaluationResult:
-        prompt = evaluation_user_prompt(question, answer, context)
+        prompt = evaluation_user_prompt(query, answer, context)
         faithful_result, complete_result = await run_pair(
             self._judge(FAITHFULNESS_SYSTEM, prompt, FaithfulnessEvaluation),
             self._judge(COMPLETENESS_SYSTEM, prompt, CompletenessEvaluation),

@@ -424,14 +424,14 @@ class SearchHandler:
         state.generation_repairs_used += 1
         packed = evidence.context.packed_context
         repaired = await self._generator.repair(
-            question=state.query.canonical_question,
+            query=state.query,
             previous_answer=generation.draft.answer,
             context=packed,
             faithfulness=evaluation.faithfulness,
             completeness=evaluation.completeness,
         )
         repaired_evaluation = await self._evaluator.evaluate(
-            question=state.query.canonical_question,
+            query=state.query,
             answer=repaired.draft.answer,
             context=packed,
         )
@@ -472,15 +472,15 @@ class SearchHandler:
         evidence: _Evidence,
     ) -> tuple[GenerationResult | None, EvaluationResult]:
         if not evidence.available:
-            return None, self._empty_evaluation(state.query.canonical_question)
+            return None, self._empty_evaluation(state.query.literal_question)
         packed = evidence.context.packed_context
         generation = await self._generator.generate(
-            question=state.query.canonical_question,
+            query=state.query,
             context=packed,
             conversation_facts=_conversation_facts(state, plan),
         )
         evaluation = await self._evaluator.evaluate(
-            question=state.query.canonical_question,
+            query=state.query,
             answer=generation.draft.answer,
             context=packed,
         )

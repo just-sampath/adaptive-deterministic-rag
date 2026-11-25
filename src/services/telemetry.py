@@ -119,13 +119,16 @@ class TelemetryService:
         return f"len={len(text)}"
 
     def project_trace(self, trace: RequestTrace) -> RequestTrace:
-        """Replace free text in a trace with its content-mode representation."""
+        """Apply the configured content mode and expose the same values before and after storage."""
 
-        if self._config.content_mode is ContentMode.FULL:
-            return trace
-        return trace.model_copy(
-            update={"attempts": tuple(self._project_attempt(item) for item in trace.attempts)}
-        )
+        updates: dict[str, object] = {}
+        if trace.contextualization is not None and not self._config.write_query_intent_fields:
+            updates["contextualization"] = trace.contextualization.model_copy(
+                update={"proposed_drift_score": None, "rewrite_decision": None}
+            )
+        if self._config.content_mode is not ContentMode.FULL:
+            updates["attempts"] = tuple(self._project_attempt(item) for item in trace.attempts)
+        return trace.model_copy(update=updates) if updates else trace
 
     def _project_attempt(self, attempt: AttemptTrace) -> AttemptTrace:
         return attempt.model_copy(

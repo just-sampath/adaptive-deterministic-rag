@@ -14,8 +14,9 @@ and terminal states.
 - Dense and BM25 sparse Qdrant search, rank fusion, MongoDB authorization hydration, Cohere
   reranking, structural context completion, bounded context packing, grounded generation, and
   parallel faithfulness/completeness evaluation.
-- Follow-up detection that rewrites only ambiguous conversational turns, and numbered citations
-  that point only at verified sources.
+- Follow-up detection and a pre-search check that preserves recognized identifiers and numeric
+  constraints. Generation and evaluation use the caller's literal question on every attempt.
+- Numbered citations that point only at verified sources.
 - Four finite search tries: happy path, recall expansion, query recovery, and context isolation.
 - One generation repair at most, then `COMPLETE`, `VERIFIED_PARTIAL`, or
   `INSUFFICIENT_EVIDENCE`.
@@ -119,6 +120,13 @@ instance has no older readers. For other deployments, deploy history-compatible 
 instance first, then set it to `true` in YAML. Once an enriched turn is stored, roll back only to a version that can read
 it. Disabling new writes leaves existing rows intact.
 
+| Query intent setting | Default | Meaning |
+| --- | --- | --- |
+| `retrieval.query_drift_threshold` | `0.5` | Reject a rewrite when it drops a positive share of the literal question's content words at or above this threshold. |
+| `telemetry.write_query_intent_fields` | `false` | Include the rewrite decision and proposed drift score in new request traces. Enable after all trace readers support these fields. |
+
+After enabling enriched traces, use a compatible reader for rollbacks while those traces exist.
+
 `APP_ENV` defaults to `production` when unset, so a missing value fails closed. Production startup
 rejects the placeholder `AUTH_SHARED_TOKEN`, `DEBUG_TOKEN`, and `TELEMETRY_HASH_KEY` values, and it
 rejects any of the three that is shorter than 32 characters or equal to another of the three.
@@ -135,6 +143,7 @@ APP_ENV=local
 CONFIG_DIR=config
 # Evidence packing is configured in YAML with context.tokenizer_encoding and context.tokenizer_verified_for.
 # Conversation history writes are configured in YAML with contextualization.write_history_provenance.
+# Query rewrite diagnostics are configured in YAML with telemetry.write_query_intent_fields.
 OPENAI_API_KEY=
 OPENAI_BASE_URL=
 COHERE_API_KEY=
@@ -304,6 +313,16 @@ messages from that same window. Each stage has a hard `max_context_characters` l
 of its Unicode `role: content` strings. An oversized newest message contributes its role and a
 suffix of its text. The current question, JSON escaping and fixed prompt envelope are separate.
 A detector timeout can use only this already authorized and bounded history.
+
+Before retrieval, the service checks the proposed standalone question against the caller's words.
+For example, “What about the second one?” can resolve to a named process from the authorized
+history. A rewrite that changes `P17` to `P18`, July 21st to July 22nd, or `500 MB/s` to
+`500 MB` falls back to the literal question, even when it keeps every other word.
+The check keeps limits with their fields, years with their dates, and the original spelling
+of each named JSON key. A rewrite can reorder those terms while preserving their meaning.
+A rejected rewrite's entities, constraints and conversation facts are
+discarded. Generation, repair and both judges receive the literal question as the answer target
+and the accepted question to resolve references. Query-recovery variants are for search only.
 
 Answers cite evidence with numbered markers such as `[1]` or `[1, 2]`. `citations` lists each cited
 passage once, numbered by first appearance. Markers that do not refer to verified evidence are

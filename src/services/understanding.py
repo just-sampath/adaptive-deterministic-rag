@@ -19,8 +19,10 @@ from models.domain import (
     ModelResult,
     ModelUsage,
     QueryUnderstanding,
+    RewriteDecision,
 )
 from services.contracts import FollowupDetector, TextModel
+from services.query_anchors import preserves_explicit_anchors
 from utils.errors import InfrastructureError
 from utils.prompts import CONTEXTUALIZER_SYSTEM, contextualization_user_prompt, history_line
 from utils.settings import ContextualizationConfig
@@ -116,6 +118,26 @@ def query_drift_score(literal: str, canonical: str) -> float:
     return len(dropped) / len(literal_terms)
 
 
+def drift_reaches_threshold(score: float, threshold: float) -> bool:
+    """Treat the threshold as inclusive only when the rewrite lost some content."""
+
+    return score > 0 and score >= threshold
+
+
+def _rewrite_decision(
+    literal: str, proposed: str, score: float, threshold: float
+) -> RewriteDecision:
+    if not proposed.strip():
+        return RewriteDecision.EMPTY
+    if proposed.strip() == literal.strip():
+        return RewriteDecision.UNCHANGED
+    if not preserves_explicit_anchors(literal, proposed):
+        return RewriteDecision.REJECTED_ANCHOR
+    if drift_reaches_threshold(score, threshold):
+        return RewriteDecision.REJECTED_DRIFT
+    return RewriteDecision.ACCEPTED
+
+
 def _tokens(text: str) -> list[str]:
     for pattern, replacement in _CONTRACTIONS:
         text = pattern.sub(replacement, text)
@@ -183,6 +205,7 @@ class QueryUnderstandingService:
         model_name: str,
         max_output_tokens: int,
         config: ContextualizationConfig,
+        query_drift_threshold: float,
         detection_timeout_seconds: float,
         contextualization_timeout_seconds: float,
     ) -> None:
@@ -191,6 +214,7 @@ class QueryUnderstandingService:
         self._model_name = model_name
         self._max_output_tokens = max_output_tokens
         self._config = config
+        self._query_drift_threshold = query_drift_threshold
         self._detection_timeout_seconds = detection_timeout_seconds
         self._contextualization_timeout_seconds = contextualization_timeout_seconds
 
@@ -224,10 +248,12 @@ class QueryUnderstandingService:
         if not selected:
             return _literal(question, trace, detection.usage, detection_calls)
         rewrite = await self._rewrite(question, selected)
-        return _rewritten(
+        return await asyncio.to_thread(
+            _rewritten,
             question,
             rewrite,
             trace,
+            query_drift_threshold=self._query_drift_threshold,
             usage=detection.usage + rewrite.usage,
             model_calls=(*detection_calls, _model_call("contextualization", rewrite)),
         )
@@ -312,24 +338,30 @@ def _rewritten(
     result: ModelResult[ContextualizationOutput],
     trace: ContextualizationTrace,
     *,
+    query_drift_threshold: float,
     usage: ModelUsage,
     model_calls: tuple[ModelCallTrace, ...],
 ) -> UnderstandingResult:
     standalone = result.value.standalone_question
-    if not standalone.strip():
+    score = query_drift_score(question, standalone)
+    decision = _rewrite_decision(question, standalone, score, query_drift_threshold)
+    rewritten = decision is RewriteDecision.ACCEPTED
+    trace = trace.model_copy(
+        update={"proposed_drift_score": score, "rewrite_decision": decision, "rewritten": rewritten}
+    )
+    if not rewritten and decision is not RewriteDecision.UNCHANGED:
         return _literal(question, trace, usage, model_calls)
-    rewritten = standalone.strip() != question.strip()
     return UnderstandingResult(
         query=QueryUnderstanding(
             literal_question=question,
-            canonical_question=standalone,
+            canonical_question=standalone if rewritten else question,
             rewritten=rewritten,
             relevant_conversation_context=result.value.relevant_conversation_context,
             entities=result.value.entities,
             constraints=result.value.constraints,
         ),
         usage=usage,
-        trace=trace.model_copy(update={"rewritten": rewritten}),
+        trace=trace,
         model_calls=model_calls,
     )
 

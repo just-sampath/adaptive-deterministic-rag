@@ -38,6 +38,7 @@ from models.domain import (
     RetrievalStrategy,
     RetryDecision,
     RetryHypothesis,
+    RewriteDecision,
     SearchHit,
 )
 from providers.sparse import Bm25SparseEncoder
@@ -139,7 +140,9 @@ def scripted_store(
 def _telemetry(repository: FakeRepository) -> TelemetryService:
     return TelemetryService(
         repository,
-        TelemetryConfig(enabled=True, content_mode=ContentMode.METADATA_ONLY),
+        TelemetryConfig(
+            enabled=True, content_mode=ContentMode.METADATA_ONLY, write_query_intent_fields=True
+        ),
         hash_key=b"test-telemetry-key",
     )
 
@@ -214,6 +217,7 @@ def build_orchestrator(
             model_name="context-model",
             max_output_tokens=256,
             config=contextualization,
+            query_drift_threshold=retrieval.query_drift_threshold,
             detection_timeout_seconds=STAGE_SECONDS,
             contextualization_timeout_seconds=STAGE_SECONDS,
         ),
@@ -351,6 +355,309 @@ def _generation_payloads(model: FakeTextModel) -> list[dict[str, object]]:
     return [
         json.loads(prompt) for output, prompt in model.output_prompts if output is GenerationDraft
     ]
+
+
+def _assert_answer_targets(model: FakeTextModel, literal: str, accepted: str) -> None:
+    for kind, prompt in model.output_prompts:
+        if kind in (GenerationDraft, FaithfulnessEvaluation, CompletenessEvaluation):
+            payload = json.loads(prompt)
+            assert payload["literal_question"] == literal
+            assert payload["accepted_question"] == accepted
+
+
+class _StoppingJudge(FakeTextModel):
+    """Judge stopping and trace storage independently, even when both facts are supported."""
+
+    async def complete(self, **kwargs: Any) -> Any:
+        if kwargs["output_type"] is CompletenessEvaluation:
+            payload = json.loads(kwargs["user_prompt"])
+            target = payload["literal_question"]
+            term = "stop" if "stop" in target else "MongoDB"
+            answered = term in payload["answer"]
+            self.queue(
+                CompletenessEvaluation,
+                CompletenessEvaluation(
+                    passed=answered,
+                    failure_type=CompletenessStatus.COMPLETE
+                    if answered
+                    else CompletenessStatus.MISSING_ANSWER_CONTENT,
+                    requirements=(
+                        RequirementEvaluation(
+                            requirement=target,
+                            status=RequirementStatus.ANSWERED
+                            if answered
+                            else RequirementStatus.MISSING,
+                            available_in_context=True,
+                            supporting_chunks=("E1",),
+                        ),
+                    ),
+                    missing_information_available=not answered,
+                    confidence=1,
+                ),
+            )
+        return await super().complete(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("proposed", "off_topic_draft"),
+    [
+        pytest.param("Where are request traces stored?", False, id="wrong-subject"),
+        pytest.param("Where are request traces stored?", True, id="grounded-but-off-topic-draft"),
+        pytest.param("What terminates the search process?", False, id="low-overlap-paraphrase"),
+    ],
+)
+def test_literal_fallback_answers_the_callers_question(
+    identity: Identity, make_settings: Callable[..., Settings], proposed: str, off_topic_draft: bool
+) -> None:
+    literal = "When does retrieval stop?"
+    chunk = make_chunk(
+        CHUNK_ID, text="Retrieval stops at the attempt limit. MongoDB stores traces."
+    )
+    repository = FakeRepository((chunk,))
+    repository.messages[identity.tenant_id, identity.user_id, "guide"].extend(
+        (
+            ConversationMessage(role="user", content="Explain the search service"),
+            ConversationMessage(
+                role="assistant",
+                content="It retrieves passages.",
+                evidence_refs=(EvidenceRef.from_chunk(chunk),),
+            ),
+        )
+    )
+    store = hit_store()
+    model = _StoppingJudge()
+    model.queue(
+        ContextualizationOutput,
+        ContextualizationOutput(
+            standalone_question=proposed,
+            relevant_conversation_context=("Find the MongoDB collection.",),
+        ),
+    )
+    correct = GenerationDraft(answer="Retrieval stops at the attempt limit [E1].")
+    if off_topic_draft:
+        model.queue(GenerationDraft, GenerationDraft(answer="MongoDB stores traces [E1]."))
+        model.queue(FaithfulnessEvaluation, _supported())
+    model.queue(GenerationDraft, correct)
+    model.queue(FaithfulnessEvaluation, _supported())
+    handler = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=store,
+        detector=FakeFollowupDetector(probability=1),
+    )
+    with TestClient(
+        make_app(make_context(make_settings(), query=handler, repository=repository))
+    ) as client:
+        response = client.post(
+            "/v1/rag/query",
+            headers=TRUSTED_HEADERS,
+            json={"message": literal, "conversation_id": "guide"},
+        )
+    assert response.status_code == 200
+    answer = response.json()
+    assert answer["status"] == ResultStatus.COMPLETE.value
+    assert answer["answer"] == "Retrieval stops at the attempt limit [1]."
+    assert answer["metadata"]["generation_repaired"] is off_topic_draft
+    trace = repository.traces[answer["request_id"]].contextualization
+    assert trace is not None and trace.rewrite_decision is RewriteDecision.REJECTED_DRIFT
+    assert trace.proposed_drift_score == 1
+    assert store.search_calls == 1 and store.last_query is not None
+    assert store.last_query.text == literal
+    assert _generation_payloads(model)[0]["relevant_conversation_facts"] == []
+    assert model.calls.count(CompletenessEvaluation) == 1 + int(off_topic_draft)
+    _assert_answer_targets(model, literal, literal)
+
+
+@pytest.mark.parametrize(
+    ("literal", "altered", "reordered"),
+    [
+        pytest.param(
+            "Which records have retry_count <= 3 and batch_size <= 10?",
+            "Which archive records have retry_count <= 10 and batch_size <= 3?",
+            "Which archive records have batch_size <= 10 and retry_count <= 3?",
+            id="field-limits",
+        ),
+        pytest.param(
+            "Which records have cost <= $3 and price <= $10?",
+            "Which archive records have cost <= $10 and price <= $3?",
+            "Which archive records have $10 >= price and $3 >= cost?",
+            id="currency-bounds",
+        ),
+        pytest.param(
+            "Does it cost $50 per month?",
+            "Does the archive plan cost $50 per year?",
+            "Does the archive plan cost $50/month?",
+            id="currency-rate-period",
+        ),
+        pytest.param(
+            "Which plans have fee <= $50/month and seat <= $10/month?",
+            "Which archive plans have seat <= $50 per month and fee <= $10 per month?",
+            "Which archive plans have seat <= $10 per month and fee <= $50 per month?",
+            id="currency-rate-bounds",
+        ),
+        pytest.param(
+            "Which records have start < 2025-07-21 and end < 2026-07-22?",
+            "Which archive records have start < 2026-07-22 and end < 2025-07-21?",
+            "Which archive records have end < 2026-07-22 and start < 2025-07-21?",
+            id="iso-date-bounds",
+        ),
+        pytest.param(
+            'Which records have "from" <= 3 and "to" <= 10?',
+            'Which archive records have "from" <= 10 and "to" <= 3?',
+            'Which archive records have 10 >= "to" and 3 >= "from"?',
+            id="quoted-fields",
+        ),
+        pytest.param(
+            "Compare the archive deadlines July 21st, 2025 and July 22nd, 2026.",
+            "Compare the migration archive deadlines July 21st, 2026 and July 22nd, 2025.",
+            "Compare the migration archive deadlines July 22nd, 2026 and July 21st, 2025.",
+            id="calendar-years",
+        ),
+        pytest.param(
+            "What do the JSON keys `Tag7` and `OwnerID` mean in that schema?",
+            "What do the JSON keys `Tag7` and `ownerId` mean in the archive schema?",
+            "What do the JSON keys `OwnerID` and `Tag7` mean in the archive schema?",
+            id="json-key-list",
+        ),
+        pytest.param(
+            "Compare JSON keys Tag7, name and OwnerID in that archive.",
+            "Compare JSON keys Tag7, name and ownerid in the migration archive.",
+            "Compare JSON keys OwnerID, name and Tag7 in the migration archive.",
+            id="label-as-key",
+        ),
+        pytest.param(
+            'Explain the JSON keys "Tag7" and "OwnerID" and describe that archive.',
+            'Describe the migration archive and explain the JSON keys "ownerid" and "Tag7".',
+            'Describe the migration archive and explain the JSON keys "OwnerID" and "Tag7".',
+            id="key-list-with-second-clause",
+        ),
+        pytest.param(
+            "Explain the Tag7, name, and OwnerID JSON keys in that archive.",
+            "Explain the Tag7, OwnerID, and Name JSON keys in the migration archive.",
+            "Explain the Tag7, OwnerID, and name JSON keys in the migration archive.",
+            id="label-as-preposed-key",
+        ),
+        pytest.param(
+            "Are JSON keys Tag7 and name the required keys in that schema?",
+            "Are JSON keys Tag7 and Name the required keys in the archive schema?",
+            "Are JSON keys name and Tag7 the required keys in the archive schema?",
+            id="key-before-predicate",
+        ),
+        pytest.param(
+            "Explain JSON keys Tag7 and OwnerID and show examples from that archive.",
+            "Show examples from the archive and explain JSON keys ownerid and Tag7.",
+            "Show examples from the archive and explain JSON keys OwnerID and Tag7.",
+            id="clause-after-complete-list",
+        ),
+        pytest.param(
+            "Compare JSON keys Tag7, from, and OwnerID in that archive.",
+            "Compare JSON keys from, Tag7, and ownerid in the migration archive.",
+            "Compare JSON keys from, Tag7, and OwnerID in the migration archive.",
+            id="stopword-as-list-item",
+        ),
+    ],
+)
+@pytest.mark.parametrize("preserved", [False, True], ids=["altered", "reordered"])
+async def test_query_sent_to_retrieval_preserves_structured_terms(
+    identity: Identity, literal: str, altered: str, reordered: str, preserved: bool
+) -> None:
+    chunk = make_chunk(CHUNK_ID, text="The guide covers the migration archive.")
+    repository = FakeRepository((chunk,))
+    repository.messages[identity.tenant_id, identity.user_id, "guide"].extend(
+        (
+            ConversationMessage(role="user", content="Which archive does the guide cover?"),
+            ConversationMessage(
+                role="assistant",
+                content="The migration archive.",
+                evidence_refs=(EvidenceRef.from_chunk(chunk),),
+            ),
+        )
+    )
+    store = hit_store()
+    model = FakeTextModel()
+    proposal = reordered if preserved else altered
+    model.queue(ContextualizationOutput, ContextualizationOutput(standalone_question=proposal))
+    queue_complete_answer(model, "The guide covers the migration archive [E1].")
+    handler = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=store,
+        detector=FakeFollowupDetector(probability=1),
+    )
+
+    response = await handler.query(identity, QueryRequest(message=literal, conversation_id="guide"))
+
+    expected_query = reordered if preserved else literal
+    assert store.search_calls == 1 and store.last_query is not None
+    assert store.last_query.text == expected_query
+    trace = repository.traces[response.request_id].contextualization
+    assert trace is not None
+    assert trace.rewrite_decision is (
+        RewriteDecision.ACCEPTED if preserved else RewriteDecision.REJECTED_ANCHOR
+    )
+    _assert_answer_targets(model, literal, expected_query)
+
+
+async def test_changed_filing_date_cannot_hide_available_evidence(identity: Identity) -> None:
+    class FilingDateIndex(FakeVectorSearch):
+        async def search(
+            self,
+            query: EncodedQuery,
+            identity: Identity,
+            filters: dict[str, str | int | float | bool],
+            *,
+            dense_k: int,
+            sparse_k: int,
+        ) -> HybridHits:
+            if "July 21st" in query.text:
+                self.dense_hits = [SearchHit(chunk_id=CHUNK_ID, score=1, rank=1)]
+            else:
+                self.dense_hits = []
+            return await super().search(
+                query, identity, filters, dense_k=dense_k, sparse_k=sparse_k
+            )
+
+    literal = "For that archive, is the filing deadline July 21st?"
+    chunk = make_chunk(CHUNK_ID, text="The migration archive filing deadline is July 21st.")
+    repository = FakeRepository((chunk,))
+    repository.messages[identity.tenant_id, identity.user_id, "archive"].extend(
+        (
+            ConversationMessage(role="user", content="Which archive?"),
+            ConversationMessage(
+                role="assistant",
+                content="The migration archive.",
+                evidence_refs=(EvidenceRef.from_chunk(chunk),),
+            ),
+        )
+    )
+    model = FakeTextModel()
+    model.queue(
+        ContextualizationOutput,
+        ContextualizationOutput(
+            standalone_question="For the migration archive, is the filing deadline July 22nd?"
+        ),
+    )
+    model.queue(
+        QueryRecoveryOutput, QueryRecoveryOutput(keyword_query="migration filing July 22nd")
+    )
+    queue_complete_answer(model, "The filing deadline is July 21st [E1].")
+    store = FilingDateIndex()
+    handler = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=store,
+        detector=FakeFollowupDetector(probability=1),
+    )
+
+    response = await handler.query(
+        identity, QueryRequest(message=literal, conversation_id="archive")
+    )
+
+    assert response.status is ResultStatus.COMPLETE
+    assert response.answer == "The filing deadline is July 21st [1]."
+    assert store.search_calls == 1 and store.last_query is not None
+    assert store.last_query.text == literal
+    _assert_answer_targets(model, literal, literal)
 
 
 class _SourcesUnavailableRepository(FakeRepository):
@@ -521,7 +828,7 @@ async def test_partial_answer_after_exhausting_strategies_discloses_unanswered_r
 ) -> None:
     repository, vector_store = _bilingual_handbook()
     model = FakeTextModel()
-    model.queue(QueryRecoveryOutput, QueryRecoveryOutput())
+    model.queue(QueryRecoveryOutput, QueryRecoveryOutput(keyword_query="handbook capabilities"))
     queue_partial_rounds(model, rounds=3)
     telemetry = _RecordingTelemetry(repository)
     orchestrator = build_orchestrator(
@@ -551,9 +858,11 @@ async def test_partial_answer_after_exhausting_strategies_discloses_unanswered_r
         RECOVERY.value,
         RECALL.value,
     ]
-    assert all(event["count"] == 1 for event in mismatches)
+    # Recovery ran both the accepted query and its distinct keyword variant.
+    assert [event["count"] for event in mismatches] == [1, 2, 1]
     trace = repository.traces[response.request_id]
     assert trace.attempted_strategies == (HAPPY, RECOVERY, RECALL)
+    _assert_answer_targets(model, "Explain the feature", "Explain the feature")
     assert trace.final_status is ResultStatus.VERIFIED_PARTIAL
     assert trace.degraded is False
     assert trace.error_code is None
@@ -740,14 +1049,16 @@ def test_partial_disclosure_survives_http_storage_and_the_next_model_prompts(
 async def test_conversation_history_is_contextualized_recorded_and_extended(
     identity: Identity,
 ) -> None:
-    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    repository = FakeRepository(
+        (make_chunk(CHUNK_ID, text="Discovery comes first. Migration proceeds in stages."),)
+    )
     key = (identity.tenant_id, identity.user_id, "conversation-1")
     repository.messages[key].extend(
         [
-            ConversationMessage(role="user", content="Tell me about migration"),
+            ConversationMessage(role="user", content="Which two processes are documented?"),
             ConversationMessage(
                 role="assistant",
-                content="Migration is staged.",
+                content="Discovery comes first and migration comes second.",
                 evidence_refs=(EvidenceRef.from_chunk(repository.chunks[CHUNK_ID]),),
             ),
         ]
@@ -755,19 +1066,20 @@ async def test_conversation_history_is_contextualized_recorded_and_extended(
     model = FakeTextModel()
     model.queue(
         ContextualizationOutput,
-        ContextualizationOutput(standalone_question="Explain the feature limitations"),
+        ContextualizationOutput(standalone_question="How does migration work?"),
     )
-    queue_complete_answer(model, "Advantages [E1].")
+    queue_complete_answer(model, "Migration proceeds in stages [E1].")
+    store = hit_store()
     orchestrator = build_orchestrator(
         model=model,
         repository=repository,
-        vector_store=hit_store(),
+        vector_store=store,
         detector=FakeFollowupDetector(probability=1),
     )
 
     response = await orchestrator.query(
         identity,
-        QueryRequest(message="Explain the feature", conversation_id="conversation-1"),
+        QueryRequest(message="What about the second one?", conversation_id="conversation-1"),
     )
 
     assert response.status is ResultStatus.COMPLETE
@@ -780,10 +1092,14 @@ async def test_conversation_history_is_contextualized_recorded_and_extended(
         history_messages=2,
         selected_messages=2,
         rewritten=True,
+        proposed_drift_score=0,
+        rewrite_decision=RewriteDecision.ACCEPTED,
     )
-    assert repository.messages[key][-2].content == "Explain the feature"
-    assert repository.messages[key][-1].content == "Advantages."
-    assert response.answer == "Advantages [1]."
+    assert repository.messages[key][-2].content == "What about the second one?"
+    assert repository.messages[key][-1].content == "Migration proceeds in stages."
+    assert response.answer == "Migration proceeds in stages [1]."
+    assert store.last_query is not None and store.last_query.text == "How does migration work?"
+    _assert_answer_targets(model, "What about the second one?", "How does migration work?")
 
 
 async def test_later_turns_never_see_citation_markers_from_earlier_answers(
@@ -982,7 +1298,7 @@ async def test_contaminated_generation_is_retried_in_isolation_without_repeating
     model.queue(
         ContextualizationOutput,
         ContextualizationOutput(
-            standalone_question="Explain the feature",
+            standalone_question="Explain the migration feature",
             relevant_conversation_context=("The user asked about migration earlier.",),
         ),
     )
@@ -1029,6 +1345,7 @@ async def test_contaminated_generation_is_retried_in_isolation_without_repeating
     assert repair_decision is not None
     assert repair_decision.hypothesis is RetryHypothesis.CONTEXT_CONTAMINATION
     assert vector_store.search_calls == 1
+    _assert_answer_targets(model, "Explain the feature", "Explain the migration feature")
     first, repair, isolated = _generation_payloads(model)
     assert first["relevant_conversation_facts"] == ["The user asked about migration earlier."]
     assert "relevant_conversation_facts" not in repair
@@ -1307,7 +1624,7 @@ async def test_final_evidence_uses_every_packed_passage(identity: Identity, chan
     response = await handler.query(identity, request)
     trace = repository.traces[response.request_id]
     assert trace.final_status is ResultStatus.COMPLETE
-    assert _generation_payloads(model)[0]["question"] != request.message
+    _assert_answer_targets(model, request.message, "Which handbook applies to the new edition?")
     assert trace.final_source_ids == cited
     assert response.metadata.generation_repaired is (change == "repaired")
     assert len(_generation_payloads(model)) == (2 if change == "repaired" else 1)

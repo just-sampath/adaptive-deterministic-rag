@@ -124,7 +124,7 @@ Queries and readiness checks always address the alias.
 | Condition | Deterministic action |
 |---|---|
 | Request has a conversation ID and contextualization is enabled | Read the scoped tail, authorize complete pairs, and project a character-bounded window before detection |
-| Follow-up detected in that window | Rewrite into a standalone canonical question using selected messages |
+| Follow-up detected in that window | Propose a standalone question from selected messages. Check explicit anchors and content-word loss before choosing the search and reranking query |
 | Initial request | Run `HAPPY_PATH` |
 | Evaluators both pass | Select `COMPLETE` for final evidence checks |
 | Correctable generation failure and repair unused | Repair once, then reevaluate. Correctable means the answer omitted content the evidence holds, correcting evidence exists, or an otherwise complete answer has unsupported or contradicted claims to remove; never when the evidence lacks a requirement or no material claim is supported |
@@ -146,7 +146,13 @@ plus the last `min_recent_messages` when they fit. Both stages count the exact c
 `role: content` strings against `max_context_characters`. A single oversized newest message
 contributes a suffix after its role prefix. The current question, JSON syntax and fixed prompt
 text are outside the limit. Detector indexes refer to this projected window.
-An empty rewrite falls back to the literal question.
+An empty proposal falls back to the literal question. A changed proposal must preserve recognized
+identifiers and numeric constraints. It must also pass the content-word loss check below. A
+rejection discards all entities, constraints and conversation facts from that proposal and keeps
+the detector and rewriter usage. Every generation, repair and evaluation receives both the literal
+question and the accepted interpretation. The literal question defines the answer requirements.
+The accepted interpretation resolves references. Faithfulness judges claims against the passages,
+and completeness judges the draft against the literal requirements, including negation and quantities.
 
 ### Conversation history
 
@@ -179,18 +185,31 @@ Existing history stays on disk. New writes still pair the turn when contextualiz
 | Hypothesis | Signal | Strategy preference |
 |---|---|---|
 | `CONTEXT_CONTAMINATION` | Conversation facts were used and claims are unsupported or contradicted | `CONTEXT_ISOLATION` |
-| `QUERY_DRIFT` | Drift score at or above `query_drift_threshold`, evidence present but no supported claim, or several requirements with missing evidence | `QUERY_RECOVERY`, `RECALL_EXPANSION` |
+| `QUERY_DRIFT` | Evidence is present but supports no material claim, or the question has multiple requirements and at least one lacks the evidence needed to answer it | `QUERY_RECOVERY`, `RECALL_EXPANSION` |
 | `NOT_ANSWERABLE` | Completeness judges the question not answerable | `RECALL_EXPANSION` |
 | `LOW_RECALL` | No evidence, or a missing requirement absent from the evidence | `RECALL_EXPANSION`, `QUERY_RECOVERY` |
 | `GENERATION_ONLY` | Evidence was present but the answer omitted it or added unsupported claims | `CONTEXT_ISOLATION` if conversation facts exist |
 | `UNCLASSIFIED` | None of the above | `RECALL_EXPANSION`, `QUERY_RECOVERY`, `CONTEXT_ISOLATION` |
 
-The drift score is the share of the literal message's content words that the canonical question
-dropped. Stopwords and the words a follow-up uses to point back ("it", "that", "one", "second",
-"about") don't count; identifiers do ("product A", "EU", "v2"). Resolving a reference therefore
-scores 0. At the default `query_drift_threshold` of 0.5, dropping one of two content words is
-drift, and dropping one of three (0.33) is not. When a rewritten question is recovered, the literal
-text is searched as its own variant only if the rewrite dropped some of its content words.
+The drift score measures the share of distinct literal content words dropped by a proposal.
+Words such as “it”, “one” and “second” can point to earlier turns and are excluded. At the default
+`query_drift_threshold` of 0.5, dropping one of two content words triggers fallback. A score of
+zero passes the lexical check even at a zero threshold. Recognized explicit anchors are checked
+independently, so changing `P17` to `P18` can trigger fallback below the threshold.
+The guard keeps a written year with its month and day, a rate with its denominators, and
+each explicit assignment or comparison with its field and value. For example, reordering
+`retry_count <= 3` and `batch_size <= 10` preserves both limits. Swapping the numbers
+triggers fallback. “Policy ABC” and “the ABC policy” can resolve to the same code. Each
+named JSON key retains its spelling, including in a list before or after the label.
+
+A currency rate keeps its amount, currency and billing period. For example, `$50/month`
+and `$50 per month` express the same rate. A valid paraphrase with substantial word loss can
+still fall back. A low score alone cannot establish semantic equivalence.
+Retry classification measures the accepted question. A request that passes through query
+understanding reaches the retry policy with the literal question or an accepted rewrite that
+lost no terms or stayed below the threshold. The policy also checks that threshold when called directly.
+Query recovery can add the literal as a search variant when the accepted rewrite lost terms.
+All recovery variants leave the answer target intact, including when isolation reuses evidence.
 
 The judges' `passed` flag always follows their status (`SUPPORTED`, `COMPLETE`): the strict output
 schema cannot tie the two fields together, so a disagreeing flag is overridden rather than failing
@@ -286,6 +305,13 @@ retry reasons) become `hmac-sha256:<prefix>:len=<n>`, or `len=<n>` in metadata-o
 projected before they are queued, so pending traces held in memory are redacted too. Secrets are
 excluded from the configuration fingerprint because Pydantic serializes `SecretStr` values as
 masked data.
+
+`ContextualizationTrace.proposed_drift_score` measures the contextualizer's proposal before any
+fallback. `rewrite_decision` records `empty`, `unchanged`, `accepted`, `rejected_anchor` or
+`rejected_drift`. Both fields are optional when reading traces. With
+`telemetry.write_query_intent_fields` disabled, new MongoDB rows keep the legacy nested keys and
+pending traces expose no decision or score. Enable writes only after upgrading all trace readers.
+Existing enriched rows require compatible readers until those rows expire.
 
 The queue prevents MongoDB telemetry latency from extending a completed RAG response. A pending
 trace stays readable in-process until it is written, and the pending set is capped at the queue

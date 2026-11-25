@@ -233,6 +233,7 @@ class TimeoutConfig(ConfigModel):
 
 class TelemetryConfig(ConfigModel):
     enabled: bool = True
+    write_query_intent_fields: bool = Field(default=False, strict=True)
     content_mode: ContentMode = ContentMode.REDACTED
     queue_capacity: int = Field(default=2000, ge=1)
     batch_size: int = Field(default=100, ge=1, le=1000)

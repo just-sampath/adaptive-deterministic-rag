@@ -13,6 +13,7 @@ from models.domain import (
     FaithfulnessStatus,
     GenerationDraft,
     PackedContext,
+    QueryUnderstanding,
     RankedChunk,
     RequirementEvaluation,
     RequirementStatus,
@@ -36,6 +37,18 @@ from utils.prompts import (
 )
 
 CHUNK_ID = "00000000-0000-0000-0000-000000000001"
+QUERY = QueryUnderstanding(
+    literal_question="When does it stop?",
+    canonical_question="When does retrieval stop?",
+    rewritten=True,
+)
+
+
+def _assert_answer_questions(prompt: str) -> None:
+    payload = json.loads(prompt)
+    assert payload.get("literal_question") == "When does it stop?"
+    assert payload.get("accepted_question") == "When does retrieval stop?"
+    assert "question" not in payload
 
 
 def _context() -> PackedContext:
@@ -88,9 +101,12 @@ async def test_online_evaluator_maps_labels_to_chunk_ids_and_drops_unknown_value
     )
 
     result = await _evaluator(model).evaluate(
-        question="Question", answer="Answer [E1].", context=_context()
+        query=QUERY, answer="Answer [E1].", context=_context()
     )
 
+    prompts = dict(model.output_prompts)
+    _assert_answer_questions(prompts[FaithfulnessEvaluation])
+    _assert_answer_questions(prompts[CompletenessEvaluation])
     assert result.faithfulness.verified_sources == (CHUNK_ID,)
     assert result.completeness.requirements[0].supporting_chunks == (CHUNK_ID,)
     assert result.completeness.requirements[0].available_in_context
@@ -117,9 +133,7 @@ async def test_chunk_identifiers_returned_by_the_model_are_not_trusted() -> None
         ),
     )
 
-    result = await _evaluator(model).evaluate(
-        question="Question", answer="Answer", context=_context()
-    )
+    result = await _evaluator(model).evaluate(query=QUERY, answer="Answer", context=_context())
 
     assert result.faithfulness.passed is False
     assert result.faithfulness.failure_type is FaithfulnessStatus.NO_SUPPORTED_MATERIAL_CLAIMS
@@ -147,9 +161,7 @@ async def test_unsupported_requirement_without_surviving_support_is_not_availabl
         ),
     )
 
-    result = await _evaluator(model).evaluate(
-        question="Question", answer="Answer", context=_context()
-    )
+    result = await _evaluator(model).evaluate(query=QUERY, answer="Answer", context=_context())
 
     requirement = result.completeness.requirements[0]
     assert requirement.available_in_context is False
@@ -177,9 +189,7 @@ async def test_missing_requirement_supported_by_context_is_missing_answer_conten
         ),
     )
 
-    result = await _evaluator(model).evaluate(
-        question="Question", answer="Answer", context=_context()
-    )
+    result = await _evaluator(model).evaluate(query=QUERY, answer="Answer", context=_context())
 
     assert result.completeness.failure_type is CompletenessStatus.MISSING_ANSWER_CONTENT
     assert result.completeness.requirements[0].available_in_context
@@ -212,9 +222,7 @@ async def test_failed_completeness_keeps_model_failure_type_when_nothing_is_miss
         ),
     )
 
-    result = await _evaluator(model).evaluate(
-        question="Question", answer="Answer", context=_context()
-    )
+    result = await _evaluator(model).evaluate(query=QUERY, answer="Answer", context=_context())
 
     assert result.completeness.failure_type is declared
 
@@ -239,9 +247,7 @@ async def test_model_declared_question_not_answerable_is_kept() -> None:
         ),
     )
 
-    result = await _evaluator(model).evaluate(
-        question="Question", answer="Answer", context=_context()
-    )
+    result = await _evaluator(model).evaluate(query=QUERY, answer="Answer", context=_context())
 
     assert result.completeness.failure_type is CompletenessStatus.QUESTION_NOT_ANSWERABLE
 
@@ -276,9 +282,7 @@ async def test_completeness_pass_with_a_missing_requirement_is_a_failure(
         ),
     )
 
-    result = await _evaluator(model).evaluate(
-        question="Question", answer="Answer", context=_context()
-    )
+    result = await _evaluator(model).evaluate(query=QUERY, answer="Answer", context=_context())
 
     assert result.completeness.passed is False
     assert result.completeness.failure_type is expected
@@ -319,7 +323,7 @@ async def test_faithfulness_pass_that_lists_failed_claims_is_a_failure(
     )
 
     result = await _evaluator(model).evaluate(
-        question="Question", answer="Answer [E1].", context=_context()
+        query=QUERY, answer="Answer [E1].", context=_context()
     )
 
     assert result.faithfulness.passed is False
@@ -350,9 +354,7 @@ async def test_contradicted_claim_evidence_and_correcting_labels_map_to_chunk_id
         ),
     )
 
-    result = await _evaluator(model).evaluate(
-        question="Question", answer="Answer", context=_context()
-    )
+    result = await _evaluator(model).evaluate(query=QUERY, answer="Answer", context=_context())
 
     assert result.faithfulness.contradicted_claims[0].evidence_chunk_ids == (CHUNK_ID,)
     assert result.faithfulness.correcting_chunks == (CHUNK_ID,)
@@ -384,9 +386,9 @@ async def test_generation_and_repair_calls_are_traced_under_their_own_operations
         confidence=0.5,
     )
 
-    generated = await service.generate(question="Q", context=context, conversation_facts=())
+    generated = await service.generate(query=QUERY, context=context, conversation_facts=())
     repaired = await service.repair(
-        question="Q",
+        query=QUERY,
         previous_answer="First",
         context=context,
         faithfulness=failing,
@@ -396,10 +398,13 @@ async def test_generation_and_repair_calls_are_traced_under_their_own_operations
     assert generated.model_call.operation == "generation"
     assert repaired.model_call.operation == "repair"
     assert repaired.draft.answer == "Second"
+    (_, generation_prompt), (_, repair_prompt) = model.output_prompts
+    _assert_answer_questions(generation_prompt)
+    _assert_answer_questions(repair_prompt)
 
 
 def test_evidence_payload_carries_labels_and_never_chunk_identifiers() -> None:
-    prompt = generation_user_prompt("Question", _context(), ())
+    prompt = generation_user_prompt(QUERY, _context(), ())
 
     assert json.loads(prompt)["evidence"][0]["evidence_label"] == "E1"
     assert CHUNK_ID not in prompt
@@ -407,7 +412,7 @@ def test_evidence_payload_carries_labels_and_never_chunk_identifiers() -> None:
 
 def test_repair_feedback_refers_to_evidence_labels_only() -> None:
     prompt = repair_user_prompt(
-        question="Question",
+        query=QUERY,
         previous_answer="Answer [E1].",
         context=_context(),
         faithfulness=FaithfulnessEvaluation(
@@ -460,10 +465,10 @@ async def test_generation_is_bounded_by_its_stage_budget() -> None:
     )
 
     with pytest.raises(TimeoutError):
-        await service.generate(question="Q", context=_context(), conversation_facts=())
+        await service.generate(query=QUERY, context=_context(), conversation_facts=())
     with pytest.raises(TimeoutError):
         await service.repair(
-            question="Q",
+            query=QUERY,
             previous_answer="A",
             context=_context(),
             faithfulness=FaithfulnessEvaluation(
@@ -482,7 +487,7 @@ async def test_generation_is_bounded_by_its_stage_budget() -> None:
 async def test_evaluation_judges_are_bounded_by_their_stage_budget() -> None:
     with pytest.raises(TimeoutError):
         await _evaluator(StalledTextModel()).evaluate(
-            question="Q",
+            query=QUERY,
             answer="A",
             context=_context(),
         )
@@ -500,8 +505,8 @@ def test_prompt_versions_record_the_revision_of_each_model_stage() -> None:
 
     assert {stage: PROMPT_VERSIONS[stage] for stage in stages} == {
         "followup_detector": "followup_detector:v1",
-        "generator": "generator:v2",
-        "faithfulness": "faithfulness:v2",
-        "completeness": "completeness:v2",
-        "repair": "repair:v2",
+        "generator": "generator:v3",
+        "faithfulness": "faithfulness:v3",
+        "completeness": "completeness:v3",
+        "repair": "repair:v3",
     }

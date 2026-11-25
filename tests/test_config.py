@@ -140,6 +140,20 @@ def test_history_provenance_write_flag_rejects_non_booleans(
         make_settings(contextualization={"write_history_provenance": value})
 
 
+def test_query_intent_trace_writes_require_opt_in(make_settings: Callable[..., Settings]) -> None:
+    assert make_settings().telemetry.write_query_intent_fields is False
+    settings = make_settings(telemetry={"write_query_intent_fields": True})
+    assert settings.telemetry.write_query_intent_fields is True
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, None])
+def test_query_intent_trace_write_flag_rejects_non_booleans(
+    make_settings: Callable[..., Settings], value: object
+) -> None:
+    with pytest.raises(ValidationError, match="bool_type"):
+        make_settings(telemetry={"write_query_intent_fields": value})
+
+
 def test_unverified_deployment_defaults_to_byte_counting(
     make_settings: Callable[..., Settings],
 ) -> None:

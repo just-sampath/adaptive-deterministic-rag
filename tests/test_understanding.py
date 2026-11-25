@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import Sequence
 from typing import TypeVar
 
@@ -18,10 +19,11 @@ from models.domain import (
 )
 from services.contracts import FollowupDetector, TextModel
 from services.followup import ModelFollowupDetector
+from services.query_anchors import preserves_explicit_anchors
 from services.understanding import QueryUnderstandingService, query_drift_score
 from tests.fakes import FakeFollowupDetector, FakeTextModel
 from utils.errors import InfrastructureError, ProviderError
-from utils.settings import ContextualizationConfig
+from utils.settings import ContextualizationConfig, RetrievalConfig
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
@@ -104,6 +106,7 @@ def make_service(
     detector: FollowupDetector,
     model: TextModel,
     config: ContextualizationConfig | None = None,
+    query_drift_threshold: float = RetrievalConfig().query_drift_threshold,
     detection_timeout_seconds: float = 1.0,
     contextualization_timeout_seconds: float = 1.0,
 ) -> QueryUnderstandingService:
@@ -113,6 +116,7 @@ def make_service(
         model_name="contextualizer-test",
         max_output_tokens=256,
         config=config if config is not None else ContextualizationConfig(),
+        query_drift_threshold=query_drift_threshold,
         detection_timeout_seconds=detection_timeout_seconds,
         contextualization_timeout_seconds=contextualization_timeout_seconds,
     )
@@ -262,6 +266,8 @@ async def test_empty_history_returns_literal_question_without_detection() -> Non
     assert result.trace.enabled is True
     assert result.trace.history_messages == 0
     assert result.trace.followup_probability is None
+    assert result.trace.proposed_drift_score is None
+    assert result.trace.rewrite_decision is None
     assert detector.detect_calls == 0
     assert model.calls == []
 
@@ -439,6 +445,433 @@ async def test_rewrite_returns_canonical_question_and_conversation_context() -> 
     assert [call.operation for call in result.model_calls] == ["contextualization"]
 
 
+@pytest.mark.parametrize(
+    ("literal", "proposed", "reason"),
+    [
+        ("When does retrieval stop?", "Where are traces stored?", "rejected_drift"),
+        ("Explain pricing limits", "Explain pricing", "accepted"),
+        ("Pricing limits?", "Pricing?", "rejected_drift"),
+        (
+            "Show the audit retention rules for policy P17 in the archive",
+            "Show the audit retention rules for policy P18 in the archive",
+            "rejected_anchor",
+        ),
+        (
+            "Where does P17 define archive retention?",
+            "Where does the policy define archive retention?",
+            "rejected_anchor",
+        ),
+        ("P17?", "Storage?", "rejected_anchor"),
+        (
+            "Does the archive charge €50 per month per user?",
+            "Does the archive charge €50 per month?",
+            "rejected_anchor",
+        ),
+        (
+            "Is the fee £1,200.50/month/user in that archive?",
+            "Is the fee £1,200.50 per month per user in the migration archive?",
+            "accepted",
+        ),
+        (
+            "Is the archive balance -$50 per month?",
+            "Is the archive balance $50/month?",
+            "rejected_anchor",
+        ),
+        (
+            "Does the archive charge €50 per month?",
+            "Does the archive charge £50 per month?",
+            "rejected_anchor",
+        ),
+        (
+            "Explain the Tag7, OwnerID, and Region JSON keys in the archive schema.",
+            "Explain the Region, Tag7, and OwnerID JSON keys in the archive schema.",
+            "accepted",
+        ),
+        (
+            "What do the AWS JSON keys `Tag7` and `OwnerID` mean in the archive schema?",
+            "What do the AWS JSON keys `Tag7` and `ownerid` mean in the migration archive schema?",
+            "rejected_anchor",
+        ),
+        (
+            "Explain the archive schema JSON keys:Tag7,OwnerID.",
+            "Explain the archive schema JSON keys:Tag7,ownerid.",
+            "rejected_anchor",
+        ),
+        (
+            "Explain the Tag7, OwnerID, and Region JSON keys in the archive schema.",
+            "Explain the Tag7, ownerid, and Region JSON keys in the archive schema.",
+            "rejected_anchor",
+        ),
+        (
+            "Explain JSON keys A and B in the archive schema.",
+            "Explain JSON keys A and b in the archive schema.",
+            "rejected_anchor",
+        ),
+        (
+            "Compare the date of the 2025 filing with that archive deadline on July 21.",
+            "Compare the date of the 2025 filing with the archive deadline on July 21, 2025.",
+            "accepted",
+        ),
+        (
+            "Select records with 3 <= retry_count < 10 in that archive.",
+            "Select records with retry_count < 10 and retry_count >= 3 in the archive.",
+            "accepted",
+        ),
+        (
+            "Show archive records with latency >= 2 days and retention >= 2 hours.",
+            "Show archive records with latency >= 2 hours and retention >= 2 days.",
+            "rejected_anchor",
+        ),
+        (
+            "Show archive records with 3 >= retry_count and 10 >= batch_size.",
+            "Show archive records with retry_count <= 3 and batch_size <= 10.",
+            "accepted",
+        ),
+        (
+            "Show archive records with 3 >= retry_count and 10 >= batch_size.",
+            "Show archive records with 10 >= retry_count and 3 >= batch_size.",
+            "rejected_anchor",
+        ),
+        (
+            "Show archive records with retry_count != 3 and batch_size != 10.",
+            "Show archive records with retry_count != 10 and batch_size != 3.",
+            "rejected_anchor",
+        ),
+        (
+            "Compare filing deadlines on 21 July 2025 and 22 July 2026.",
+            "Compare filing deadlines on July 22nd, 2026 and July 21st, 2025.",
+            "accepted",
+        ),
+        (
+            "Compare filing deadlines on 21 July 2025 and 22 July 2026.",
+            "Compare filing deadlines on 21 July 2026 and 22 July 2025.",
+            "rejected_anchor",
+        ),
+        (
+            "Compare the archive filing deadlines July 21st, 2025 and July 22nd, 2026.",
+            "Compare the archive filing deadlines July 21st and July 22nd, 2026 "
+            "in the 2025 report.",
+            "rejected_anchor",
+        ),
+        (
+            "What about the JSON keys `Tag7`, `OwnerID`, and `Region` in the archive schema?",
+            "What about the JSON keys `Tag7`, `ownerId`, and `Region` in the archive schema?",
+            "rejected_anchor",
+        ),
+        (
+            "What about the JSON keys Tag7, OwnerID and Region in the archive schema?",
+            "What about the JSON keys Tag7, OwnerID and region in the archive schema?",
+            "rejected_anchor",
+        ),
+        (
+            "Compare the JSON key `Tag7` with `OwnerID` in the archive schema.",
+            "Compare the JSON key `Tag7` with `ownerId` in the archive schema.",
+            "rejected_anchor",
+        ),
+        (
+            "Explain the `Tag7` and `OwnerID` JSON keys in the archive schema.",
+            "Explain the `tag7` and `OwnerID` JSON keys in the archive schema.",
+            "rejected_anchor",
+        ),
+        (
+            "Compare the JSON keys `Owner, ID` and `Tag7` in the archive schema.",
+            "Compare the JSON keys `Tag7` and `Owner, ID` in the migration archive schema.",
+            "accepted",
+        ),
+        (
+            "Explain the JSON key `Tag7` and describe the migration archive schema.",
+            "Describe the migration archive schema and explain the JSON key `Tag7`.",
+            "accepted",
+        ),
+        (
+            "What does that schema say about key `Tag7` (case-sensitive)?",
+            "What does the archive schema say about key `tag7` (case-sensitive)?",
+            "rejected_anchor",
+        ),
+        (
+            "What does that archive say about the JSON key named \"'Tag7'\"?",
+            'What does the migration archive say about the JSON key named "Tag7"?',
+            "rejected_anchor",
+        ),
+        (
+            "Where is the `Tag7` JSON key documented in that schema?",
+            "Where can I find the `Tag7` JSON key in the archive schema?",
+            "accepted",
+        ),
+        (
+            "Which JSON key is used for the archive retention date?",
+            "Which JSON key holds the archive retention date?",
+            "accepted",
+        ),
+        (
+            "What does the JSON key `Tag7` mean for the archive?",
+            "What does the JSON key `tag7` mean for the archive named Tag7?",
+            "rejected_anchor",
+        ),
+        (
+            "Is this archive limited to 500 B/s during migration?",
+            "Is this archive limited to 500 b/s during migration?",
+            "rejected_anchor",
+        ),
+        (
+            "Are the upload limits 500 MB/s/user for that archive?",
+            "Are the upload limits 500 MB/s for the migration archive?",
+            "rejected_anchor",
+        ),
+        (
+            "Show the transfer limit of 500 MB per second per user",
+            "Show the archive transfer limit of 500 MB/s/user",
+            "accepted",
+        ),
+        (
+            "What does the `Tag7` JSON key mean in that schema?",
+            "What does the `tag7` JSON key mean in the archive schema?",
+            "rejected_anchor",
+        ),
+        (
+            "What does that schema say about the case-sensitive key 'display name'?",
+            "What does the archive schema say about the case-sensitive key 'Display name'?",
+            "rejected_anchor",
+        ),
+        (
+            "Is the retention period longer for plan A?",
+            "Is the retention period longer for the A plan in Europe?",
+            "accepted",
+        ),
+        (
+            "Could you give plan A a longer retention period?",
+            "Could you give a plan a longer retention period?",
+            "rejected_anchor",
+        ),
+        (
+            "How does policy P17 handle archive retention?",
+            "How does P17 handle archive retention in Europe?",
+            "accepted",
+        ),
+        (
+            "For that archive, is the filing deadline July 21st?",
+            "For the migration archive, is the filing deadline July 22nd?",
+            "rejected_anchor",
+        ),
+        (
+            "Is the archive deadline the 21st of July?",
+            "Is the archive deadline the 21st of June?",
+            "rejected_anchor",
+        ),
+        (
+            "Is the archive deadline July 21?",
+            "Is the migration archive deadline the 21st of July?",
+            "accepted",
+        ),
+        (
+            "Which retention rules apply to P17 = 30 days and P18 = 90 days?",
+            "Which retention rules apply to P17 = 90 days and P18 = 30 days?",
+            "rejected_anchor",
+        ),
+        (
+            "Which records have retry_count=3 and batch_size=10?",
+            "Which archive records have retry_count=10 and batch_size=3?",
+            "rejected_anchor",
+        ),
+        (
+            "Which retention rules apply to P17 = 30 days and P18 = 90 days?",
+            "Which archive retention rules apply to P18=90 days and P17=30 days?",
+            "accepted",
+        ),
+        (
+            "Show records with A=10 days and B=10 hours",
+            "Show archive records with A=10 hours and B=10 days",
+            "rejected_anchor",
+        ),
+        (
+            "What are the archive retention rules for policy `ABC`?",
+            "What are the archive retention rules for policy `XYZ`?",
+            "rejected_anchor",
+        ),
+        (
+            "What about the retention period for policy ABC?",
+            "What is the retention period for the ABC policy in the migration archive?",
+            "accepted",
+        ),
+        (
+            "What about the retention period for the 'ABC' policy?",
+            'Show the archive retention period for policy "abc".',
+            "accepted",
+        ),
+        (
+            "Could you give plan A a longer retention period?",
+            "Could you give the plan a longer retention period?",
+            "rejected_anchor",
+        ),
+        (
+            "Is the transfer limit 500 MB/s for that archive?",
+            "Is the transfer limit 500 MB for the migration archive?",
+            "rejected_anchor",
+        ),
+        (
+            "Is the transfer limit 500 MB/s for that archive?",
+            "Is the transfer limit 500 MB/min for the migration archive?",
+            "rejected_anchor",
+        ),
+        (
+            "Is the transfer limit 500 MB/s for that archive?",
+            "Is the transfer limit 500 MB per second for the migration archive?",
+            "accepted",
+        ),
+        (
+            "Is the transfer limit 500 MB/s for that archive?",
+            "Is the transfer limit 500 Mb/s for the migration archive?",
+            "rejected_anchor",
+        ),
+        (
+            "What does the case-sensitive JSON key `Tag7` mean in that schema?",
+            "What does the case-sensitive JSON key `tag7` mean in the archive schema?",
+            "rejected_anchor",
+        ),
+        (
+            "What does the case-sensitive JSON key `Tag7` mean in that schema?",
+            "What does the JSON key Tag7 mean in the archive schema?",
+            "accepted",
+        ),
+        (
+            "Where does that schema set the case-sensitive identifier RunID?",
+            "Where does the archive schema set the identifier runid?",
+            "rejected_anchor",
+        ),
+        (
+            "What are the audit limits for policy `P17`?",
+            "What are the audit limits for policy `p17` in the archive?",
+            "accepted",
+        ),
+        (
+            "Show the audit retention rules for policy ABC in the archive",
+            "Show the audit retention rules for policy XYZ in the archive",
+            "rejected_anchor",
+        ),
+        (
+            "What about the archive in region EU?",
+            "What about the archive in region US?",
+            "rejected_anchor",
+        ),
+        (
+            "What about the archive in region EU?",
+            "What about the migration archive in region eu?",
+            "accepted",
+        ),
+        ("What about the second one for P17?", "What are audit limits for p17?", "accepted"),
+        ("What about the 2nd one?", "What are audit limits?", "accepted"),
+        (
+            "Is IT subject to audit retention?",
+            "Is the service subject to audit retention?",
+            "accepted",
+        ),
+        (
+            "Is the archive retention period 1 day?",
+            "Is the archive retention period 10 days?",
+            "rejected_anchor",
+        ),
+        (
+            "Is the archive retention period 1 day?",
+            "Is the archive retention period 1 year?",
+            "rejected_anchor",
+        ),
+        (
+            "Is the archive retention period 1,000 days?",
+            "Is the archive retention period 1,000 years?",
+            "rejected_anchor",
+        ),
+        (
+            "Is the archive retention period 1,000 days?",
+            "Is the archive retention period 1000 days in Europe?",
+            "accepted",
+        ),
+        (
+            "Does the migration archive hold 500 MB per policy?",
+            "Does the migration archive hold 500 GB per policy?",
+            "rejected_anchor",
+        ),
+        (
+            "Does the archive cover records with age <= 30 days?",
+            "Does the archive cover records with age >= 30 days?",
+            "rejected_anchor",
+        ),
+        (
+            "Does the archive support version 1.2?",
+            "Does the archive support version 2.1?",
+            "rejected_anchor",
+        ),
+        (
+            "Does the archive cover policy AC-17?",
+            "Does the archive cover AC and policy 17?",
+            "rejected_anchor",
+        ),
+        (
+            "Are there archive retention limits for product A?",
+            "Are there archive retention limits for product B on a plan?",
+            "rejected_anchor",
+        ),
+        (
+            "Are there archive retention limits for product A?",
+            "Are there archive retention limits for product a in Europe?",
+            "accepted",
+        ),
+    ],
+)
+async def test_rewrite_admission(literal: str, proposed: str, reason: str) -> None:
+    model = FakeTextModel()
+    model.queue(
+        ContextualizationOutput,
+        ContextualizationOutput(
+            standalone_question=proposed,
+            entities=("proposed entity",),
+            constraints=("proposed constraint",),
+            relevant_conversation_context=("proposed fact",),
+        ),
+    )
+    service = make_service(detector=FakeFollowupDetector(), model=model)
+
+    result = await service.understand(literal, make_history("audit limits for P17"))
+
+    accepted = reason == "accepted"
+    assert result.query.canonical_question == (proposed if accepted else literal)
+    assert result.query.rewritten is accepted
+    assert result.trace.rewritten is accepted
+    assert result.trace.rewrite_decision == reason
+    assert result.trace.proposed_drift_score == query_drift_score(literal, proposed)
+    assert result.query.entities == (("proposed entity",) if accepted else ())
+    assert result.query.constraints == (("proposed constraint",) if accepted else ())
+    assert result.query.relevant_conversation_context == (("proposed fact",) if accepted else ())
+
+
+async def test_another_request_can_run_during_rewrite_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = FakeTextModel()
+    model.queue(
+        ContextualizationOutput, ContextualizationOutput(standalone_question="Archive P17?")
+    )
+    service = make_service(detector=FakeFollowupDetector(probability=1), model=model)
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+
+    def wait_for_other_request(literal: str, proposed: str) -> bool:
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(timeout=2), "rewrite validation blocked the other request"
+        return preserves_explicit_anchors(literal, proposed)
+
+    monkeypatch.setattr("services.understanding.preserves_explicit_anchors", wait_for_other_request)
+    async with asyncio.TaskGroup() as tasks:
+        pending = tasks.create_task(service.understand("P17?", make_history("Archive policies")))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            other = await service.understand("Other question?", [])
+            assert other.query.canonical_question == "Other question?"
+        finally:
+            release.set()
+    assert pending.result().query.canonical_question == "Archive P17?"
+
+
 async def test_blank_rewrite_falls_back_to_literal_question() -> None:
     model = FakeTextModel()
     model.queue(
@@ -456,15 +889,40 @@ async def test_blank_rewrite_falls_back_to_literal_question() -> None:
     assert result.query.rewritten is False
     assert result.query.relevant_conversation_context == ()
     assert result.trace.rewritten is False
+    assert result.trace.rewrite_decision == "empty"
+    assert result.trace.proposed_drift_score == 1
     assert result.trace.selected_messages == 2
     assert result.usage.total_tokens == 15
+
+
+@pytest.mark.parametrize(
+    ("proposed", "expected", "reason"),
+    [
+        (" What about the second one? ", "What about the second one?", "unchanged"),
+        ("How long do audit logs last?", "How long do audit logs last?", "accepted"),
+    ],
+)
+async def test_zero_threshold_preserves_lossless_followups(
+    proposed: str, expected: str, reason: str
+) -> None:
+    model = FakeTextModel()
+    model.queue(ContextualizationOutput, ContextualizationOutput(standalone_question=proposed))
+    service = make_service(detector=FakeFollowupDetector(), model=model, query_drift_threshold=0)
+
+    result = await service.understand(
+        "What about the second one?", make_history("traces, audit logs")
+    )
+
+    assert result.query.canonical_question == expected
+    assert result.trace.proposed_drift_score == 0
+    assert result.trace.rewrite_decision == reason
 
 
 async def test_detection_timeout_fails_open_to_bounded_history_rewrite() -> None:
     model = RecordingTextModel()
     model.queue(
         ContextualizationOutput,
-        ContextualizationOutput(standalone_question="Rewritten question"),
+        ContextualizationOutput(standalone_question="What are the audit limits?"),
     )
     service = make_service(
         detector=HangingDetector(),
@@ -479,7 +937,7 @@ async def test_detection_timeout_fails_open_to_bounded_history_rewrite() -> None
     assert result.trace.followup_probability == 1.0
     assert result.trace.detector == "hanging"
     assert prompted_history(model) == ["user: new"]
-    assert result.query.canonical_question == "Rewritten question"
+    assert result.query.canonical_question == "What are the audit limits?"
 
 
 @pytest.mark.parametrize("error", [ProviderError("upstream down"), InfrastructureError("down")])
@@ -542,6 +1000,8 @@ async def test_detection_and_rewrite_usage_and_calls_are_combined() -> None:
         "contextualization",
     ]
     assert result.usage.total_tokens == 30
+    assert result.query.canonical_question == "And its limits?"
+    assert result.trace.rewrite_decision == "rejected_drift"
     assert result.trace.detector == "model"
     assert result.trace.selected_messages == 2
     assert result.trace.fail_open is False
