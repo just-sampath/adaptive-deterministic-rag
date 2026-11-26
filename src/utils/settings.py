@@ -175,7 +175,7 @@ class FollowupDetectorName(StrEnum):
 
 class ContextualizationConfig(ConfigModel):
     enabled: bool = True
-    write_history_provenance: bool = Field(default=False, strict=True)
+    write_history_provenance: bool = Field(default=True, strict=True)
     detector: FollowupDetectorName = FollowupDetectorName.MODEL
     detector_model: str = "gpt-5.6-luna"  # stand-in until the jev adapter exists
     history_messages: int = Field(default=30, ge=1, le=100)
@@ -201,7 +201,7 @@ class ContextConfig(ConfigModel):
 
 
 class PolicyConfig(ConfigModel):
-    verify_answers: bool = Field(default=False, strict=True)
+    verify_answers: bool = Field(default=True, strict=True)
     max_generation_repairs: int = Field(default=1, ge=0, le=1)
     max_strategies: int = Field(default=4, ge=1, le=4)
     allow_verified_partial: bool = True

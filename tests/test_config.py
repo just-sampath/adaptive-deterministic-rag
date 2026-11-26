@@ -47,7 +47,7 @@ def test_local_yaml_overlays_stable_defaults(tmp_path: Path) -> None:
     assert settings.retrieval.happy_dense_k == 40
 
 
-def test_committed_local_overlay_alone_enables_history_provenance() -> None:
+def test_committed_config_enables_history_and_verification_everywhere() -> None:
     def committed(environment: Environment) -> Settings:
         return load_settings(
             ExternalSettings(
@@ -59,13 +59,11 @@ def test_committed_local_overlay_alone_enables_history_provenance() -> None:
             )
         )
 
-    assert committed(Environment.LOCAL).contextualization.write_history_provenance is True
-    assert committed(Environment.LOCAL).policy.verify_answers is True
+    for environment in (Environment.LOCAL, Environment.TEST):
+        assert committed(environment).contextualization.write_history_provenance is True
+        assert committed(environment).policy.verify_answers is True
     assert committed(Environment.LOCAL).telemetry.write_accounting_fields is True
-    default = yaml.safe_load((_PROJECT_CONFIG / "default.yaml").read_text(encoding="utf-8"))
-    assert default["contextualization"]["write_history_provenance"] is False
-    assert default["policy"]["verify_answers"] is False
-    assert default["telemetry"]["write_accounting_fields"] is False
+    assert committed(Environment.TEST).telemetry.write_accounting_fields is False
 
 
 @pytest.mark.parametrize("value", ["true", 1, None])
@@ -148,16 +146,18 @@ def test_settings_reject_unknown_stable_configuration_key(
         make_settings(retrieval={"candidate_typo": 50})
 
 
-def test_history_provenance_requires_explicit_opt_in(
+def test_history_provenance_is_on_by_default_and_can_be_disabled(
     make_settings: Callable[..., Settings],
 ) -> None:
-    assert make_settings().contextualization.write_history_provenance is False
+    assert make_settings().contextualization.write_history_provenance is True
+    assert make_settings().policy.verify_answers is True
     settings = make_settings(
-        contextualization={"write_history_provenance": True, "history_messages": 3},
+        contextualization={"write_history_provenance": False, "history_messages": 3},
         context={"max_seed_chunks": 2, "max_neighbors_per_seed": 2},
     )
-    assert settings.contextualization.write_history_provenance is True
+    assert settings.contextualization.write_history_provenance is False
     assert settings.history_ref_limit == 18
+    assert make_settings(policy={"verify_answers": False}).policy.verify_answers is False
 
 
 @pytest.mark.parametrize("value", ["true", "false", 1, None])

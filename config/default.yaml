@@ -73,7 +73,7 @@ retrieval:
 
 contextualization:
   enabled: true
-  write_history_provenance: false
+  write_history_provenance: true
   detector: model
   detector_model: gpt-5.6-luna
   history_messages: 30
@@ -92,7 +92,7 @@ context:
   short_chunk_tokens: 40
 
 policy:
-  verify_answers: false
+  verify_answers: true
   max_generation_repairs: 1
   max_strategies: 4
   allow_verified_partial: true

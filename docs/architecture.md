@@ -186,9 +186,10 @@ The manager appends the user message and assistant history text in one update an
 latest 100 messages. The history text omits generated evidence markers and keeps the same
 partial disclosure as the displayed answer. As in the displayed grammar, an `[E1]` spelling
 inside a code span is treated as a marker. Literal numeric brackets remain intact.
-Readers accept legacy and enriched messages. With `contextualization.write_history_provenance`
-disabled, writers emit exactly the legacy message keys. Enable it after all readers support
-enriched assistants. Once enriched writes begin, every rollback reader must support both formats.
+Readers accept legacy and enriched messages. `contextualization.write_history_provenance` is on
+by default. With it disabled, writers emit exactly the legacy message keys; disable it only while
+an instance that can't read enriched assistants is still running. Once enriched writes begin,
+every rollback reader must support both formats.
 Existing history stays on disk. New writes still pair the turn when contextualization is disabled.
 
 `DecisionPolicy.decide_next` classifies each failed attempt; the first matching row wins:

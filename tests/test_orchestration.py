@@ -345,7 +345,8 @@ def build_orchestrator(
         max_neighbors_per_seed=max_neighbors,
     )
     contextualization = contextualization or ContextualizationConfig()
-    policy = policy or PolicyConfig()
+    # Most cases here queue unattributed verdicts; verified answers are opted into per test.
+    policy = policy or PolicyConfig(verify_answers=False)
     encoder = HybridQueryEncoder(
         dense=FakeEmbeddings(),
         sparse=Bm25SparseEncoder(SparseConfig()),

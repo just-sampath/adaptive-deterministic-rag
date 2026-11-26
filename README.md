@@ -93,7 +93,7 @@ from environment variables with no application prefix.
 | Source | Examples |
 | --- | --- |
 | `config/default.yaml` | Models, candidate budgets, follow-up detection, policy bounds, timeouts, collection alias, sparse encoder |
-| `config/local.yaml` | Local-only overrides: `DEBUG` logging, conversation provenance writes, answer verification, trace accounting fields, and smaller telemetry queue and batch sizes |
+| `config/local.yaml` | Local-only overrides: `DEBUG` logging, trace accounting fields, and smaller telemetry queue and batch sizes |
 | Environment / `.env` | API keys, MongoDB URI, Qdrant URL/key, trusted-header secrets |
 | Environment / `.env` | `APP_ENV`, `CONFIG_DIR`, and `TELEMETRY_HASH_KEY` |
 
@@ -112,13 +112,12 @@ required evidence coverage on held-out questions before enabling this mode in pr
 
 | Conversation history setting | Default | Meaning |
 | --- | --- | --- |
-| `contextualization.write_history_provenance` | `false` | Save the evidence references a later turn needs before it can reuse this answer. |
+| `contextualization.write_history_provenance` | `true` | Save the evidence references a later turn needs before it can reuse this answer. |
 
-While this setting is `false`, saved turns keep the legacy message format and later requests
-cannot reuse them as history. `config/local.yaml` sets it to `true`, because a single local
-instance has no older readers. For other deployments, deploy history-compatible readers to every
-instance first, then set it to `true` in YAML. Once an enriched turn is stored, roll back only to a version that can read
-it. Disabling new writes leaves existing rows intact.
+Set it to `false` only while an instance that can't read enriched turns is still running. Saved
+turns then keep the legacy message format, and later requests cannot reuse them as history. Once
+an enriched turn is stored, roll back only to a version that can read it. Disabling new writes
+leaves existing rows intact.
 
 | Query intent setting | Default | Meaning |
 | --- | --- | --- |
@@ -129,13 +128,13 @@ After enabling enriched traces, use a compatible reader for rollbacks while thos
 
 | Answer verification setting | Default | Meaning |
 | --- | --- | --- |
-| `policy.verify_answers` | `false` | Reject blank drafts, check every citation marker against the claim at its position, and record each attempt's outcome in traces. |
+| `policy.verify_answers` | `true` | Reject blank drafts, check every citation marker against the claim at its position, and record each attempt's outcome in traces. |
 
 `policy.verify_answers` turns on the checks and their trace format together, because
-an attempt rejected before judging has no verdicts to store in the old layout. While it is
-`false`, answers and traces behave as before. `config/local.yaml` sets it to `true`. For other
-deployments, upgrade every trace reader first. After enabling it, roll back only to a reader that
-accepts attempts with an outcome and citation assessments.
+an attempt rejected before judging has no verdicts to store in the old layout. Set it to `false`
+only while a trace reader that doesn't accept the new attempt format is still deployed; answers
+and traces then behave as before. Once traces in the new format exist, roll back only to a reader
+that accepts attempts with an outcome and citation assessments.
 
 | Trace accounting setting | Default | Meaning |
 | --- | --- | --- |
