@@ -17,3 +17,5 @@ eval
 tests
 *.pyc
 core
+ImplementedFeatures/
+FeatureScopes/
