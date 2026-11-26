@@ -23,8 +23,9 @@ from services.contracts import DocumentReader, QueryEncoder, TextModel, VectorSe
 from services.understanding import query_drift_score
 from utils.concurrency import run_all
 from utils.prompts import QUERY_RECOVERY_SYSTEM, query_recovery_user_prompt
-from utils.request_context import observed_call
-from utils.settings import FusionStrategy, RetrievalConfig
+from utils.request_context import observed_call, stage_timeout
+from utils.retry import NO_RETRY, retry_transient
+from utils.settings import FusionStrategy, RetrievalConfig, RetryConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +73,7 @@ class QueryRecoveryService:
         timeout_seconds: float,
         max_variants: int,
         max_decomposed_queries: int,
+        retry: RetryConfig = NO_RETRY,
     ) -> None:
         self._model = model
         self._model_name = model_name
@@ -79,19 +81,26 @@ class QueryRecoveryService:
         self._timeout_seconds = timeout_seconds
         self._max_variants = max_variants
         self._max_decomposed_queries = max_decomposed_queries
+        self._retry = retry
 
     async def build(self, query: QueryUnderstanding) -> QueryVariants:
-        async with asyncio.timeout(self._timeout_seconds):
-            result = await observed_call(
+        user_prompt = query_recovery_user_prompt(query)
+        async with stage_timeout(self._timeout_seconds):
+            result = await retry_transient(
                 "query_recovery",
-                self._model_name,
-                self._model.complete(
-                    model=self._model_name,
-                    system_prompt=QUERY_RECOVERY_SYSTEM,
-                    user_prompt=query_recovery_user_prompt(query),
-                    output_type=QueryRecoveryOutput,
-                    max_output_tokens=self._max_output_tokens,
+                lambda retry: observed_call(
+                    "query_recovery",
+                    self._model_name,
+                    self._model.complete(
+                        model=self._model_name,
+                        system_prompt=QUERY_RECOVERY_SYSTEM,
+                        user_prompt=user_prompt,
+                        output_type=QueryRecoveryOutput,
+                        max_output_tokens=self._max_output_tokens,
+                    ),
+                    retry_ordinal=retry,
                 ),
+                policy=self._retry,
             )
         # A rewritten follow-up whose words all survived the rewrite ("what about the second
         # one?") adds nothing as a search of its own. When the rewrite dropped some of the user's
@@ -122,12 +131,14 @@ class HybridRetriever:
         repository: DocumentReader,
         config: RetrievalConfig,
         retrieval_timeout_seconds: float,
+        retry: RetryConfig = NO_RETRY,
     ) -> None:
         self._encoder = encoder
         self._vector_store = vector_store
         self._repository = repository
         self._config = config
         self._retrieval_timeout_seconds = retrieval_timeout_seconds
+        self._retry = retry
 
     async def retrieve(
         self,
@@ -138,13 +149,18 @@ class HybridRetriever:
         plan: RetrievalPlan,
     ) -> RetrievalOutcome:
         encoded = await self._encoder.encode(query)
-        async with asyncio.timeout(self._retrieval_timeout_seconds):
-            hits = await self._vector_store.search(
-                encoded,
-                identity,
-                filters,
-                dense_k=plan.dense_k,
-                sparse_k=plan.sparse_k,
+        async with stage_timeout(self._retrieval_timeout_seconds):
+            # Qdrant search is not a model call, so its tries have no operation rows.
+            hits = await retry_transient(
+                "retrieval",
+                lambda _retry: self._vector_store.search(
+                    encoded,
+                    identity,
+                    filters,
+                    dense_k=plan.dense_k,
+                    sparse_k=plan.sparse_k,
+                ),
+                policy=self._retry,
             )
         fused = fuse_results(
             hits.dense,

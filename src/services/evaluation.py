@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -43,7 +42,9 @@ from utils.prompts import (
     generation_user_prompt,
     repair_user_prompt,
 )
-from utils.request_context import observed_call
+from utils.request_context import observed_call, stage_timeout
+from utils.retry import NO_RETRY, retry_transient
+from utils.settings import RetryConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,11 +73,13 @@ class GenerationService:
         model_name: str,
         max_output_tokens: int,
         timeout_seconds: float,
+        retry: RetryConfig = NO_RETRY,
     ) -> None:
         self._model = model
         self._model_name = model_name
         self._max_output_tokens = max_output_tokens
         self._timeout_seconds = timeout_seconds
+        self._retry = retry
 
     async def generate(
         self,
@@ -85,18 +88,8 @@ class GenerationService:
         context: PackedContext,
         conversation_facts: Sequence[str],
     ) -> GenerationResult:
-        async with asyncio.timeout(self._timeout_seconds):
-            result = await observed_call(
-                "generation",
-                self._model_name,
-                self._model.complete(
-                    model=self._model_name,
-                    system_prompt=GENERATOR_SYSTEM,
-                    user_prompt=generation_user_prompt(query, context, conversation_facts),
-                    output_type=GenerationDraft,
-                    max_output_tokens=self._max_output_tokens,
-                ),
-            )
+        user_prompt = generation_user_prompt(query, context, conversation_facts)
+        result = await self._complete("generation", GENERATOR_SYSTEM, user_prompt)
         return _generation(result, "generation")
 
     async def repair(
@@ -109,29 +102,39 @@ class GenerationService:
         completeness: CompletenessEvaluation,
     ) -> GenerationResult:
         attributed = isinstance(faithfulness, AttributedFaithfulness)
-        async with asyncio.timeout(self._timeout_seconds):
-            result = await observed_call(
-                "repair",
-                self._model_name,
-                self._model.complete(
-                    model=self._model_name,
-                    system_prompt=ATTRIBUTION_REPAIR_SYSTEM if attributed else REPAIR_SYSTEM,
-                    user_prompt=repair_user_prompt(
-                        query=query,
-                        previous_answer=previous_answer,
-                        context=context,
-                        faithfulness=faithfulness,
-                        completeness=completeness,
-                        # The judged draft fit the table limit, so its occurrence IDs resolve here.
-                        previous_occurrences=citation_occurrences(previous_answer)
-                        if attributed
-                        else None,
-                    ),
-                    output_type=GenerationDraft,
-                    max_output_tokens=self._max_output_tokens,
-                ),
-            )
+        user_prompt = repair_user_prompt(
+            query=query,
+            previous_answer=previous_answer,
+            context=context,
+            faithfulness=faithfulness,
+            completeness=completeness,
+            # The judged draft fit the table limit, so its occurrence IDs resolve here.
+            previous_occurrences=citation_occurrences(previous_answer) if attributed else None,
+        )
+        system_prompt = ATTRIBUTION_REPAIR_SYSTEM if attributed else REPAIR_SYSTEM
+        result = await self._complete("repair", system_prompt, user_prompt)
         return _generation(result, "repair")
+
+    async def _complete(
+        self, stage: str, system_prompt: str, user_prompt: str
+    ) -> ModelResult[GenerationDraft]:
+        async with stage_timeout(self._timeout_seconds):
+            return await retry_transient(
+                stage,
+                lambda retry: observed_call(
+                    stage,
+                    self._model_name,
+                    self._model.complete(
+                        model=self._model_name,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        output_type=GenerationDraft,
+                        max_output_tokens=self._max_output_tokens,
+                    ),
+                    retry_ordinal=retry,
+                ),
+                policy=self._retry,
+            )
 
 
 class OnlineEvaluator:
@@ -144,11 +147,13 @@ class OnlineEvaluator:
         model_name: str,
         max_output_tokens: int,
         timeout_seconds: float,
+        retry: RetryConfig = NO_RETRY,
     ) -> None:
         self._model = model
         self._model_name = model_name
         self._max_output_tokens = max_output_tokens
         self._timeout_seconds = timeout_seconds
+        self._retry = retry
 
     async def evaluate(
         self,
@@ -202,17 +207,23 @@ class OnlineEvaluator:
         user_prompt: str,
         output_type: type[SchemaT],
     ) -> ModelResult[SchemaT]:
-        async with asyncio.timeout(self._timeout_seconds):
-            return await observed_call(
+        # Each judge retries inside its own run_pair child, so a retry never cancels the other.
+        async with stage_timeout(self._timeout_seconds):
+            return await retry_transient(
                 stage,
-                self._model_name,
-                self._model.complete(
-                    model=self._model_name,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    output_type=output_type,
-                    max_output_tokens=self._max_output_tokens,
+                lambda retry: observed_call(
+                    stage,
+                    self._model_name,
+                    self._model.complete(
+                        model=self._model_name,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        output_type=output_type,
+                        max_output_tokens=self._max_output_tokens,
+                    ),
+                    retry_ordinal=retry,
                 ),
+                policy=self._retry,
             )
 
 

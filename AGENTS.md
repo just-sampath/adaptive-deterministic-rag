@@ -109,9 +109,17 @@ There is no separate build step. `docker compose up --build` builds and runs the
   external endpoints and deployment selection. Propose a YAML value before a new environment
   variable.
 - **Concurrency must stay safe.** No mutable shared per-request state: request data lives in locals
-  or `ContextVar`s. Every external call has a timeout from the `timeouts` settings. Run concurrent
-  work through `run_pair` and `run_all` in `utils/concurrency.py`. The container owns every client
-  and closes it on shutdown.
+  or `ContextVar`s. Every external call has a timeout from the `timeouts` settings; open stage timers
+  with `stage_timeout` so retries inside them know the deadline. Run concurrent work through
+  `run_pair` and `run_all` in `utils/concurrency.py`. The container owns every client and closes it
+  on shutdown.
+- **Provider retries in a request go through `retry_transient` in `utils/retry.py`.** Adapters
+  raise `TransientProviderError` for failures a retry can clear and never retry themselves; the
+  OpenAI client is built with its own retries off. Retry inside each concurrent child, never
+  around `run_pair` or `run_all`. Don't retry timeouts or invalid responses, and don't add
+  application retries for MongoDB inside a request: PyMongo keeps its default retryable reads and
+  writes. The telemetry writer's single replay of a trace batch is the one retry outside this
+  helper.
 - **Keep ports narrow.** Add the smallest `Protocol` only when an existing one can't do the job, and
   follow the safe extension checklist in `docs/architecture.md`.
 - **Encoder or vector-layout changes** get a new fingerprint and a new physical collection. Reindex,

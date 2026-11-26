@@ -10,8 +10,19 @@ from typing import Any
 import httpx
 
 from models.domain import RankedChunk, RerankMetering, RerankResult
-from utils.errors import OperationTimeoutError, ProviderError, ProviderResponseError
+from utils.errors import (
+    OperationTimeoutError,
+    ProviderError,
+    ProviderResponseError,
+    TransientProviderError,
+)
 from utils.request_context import observe_response, operation
+from utils.retry import retry_after_seconds
+
+# Our choice of retryable statuses, read against https://docs.cohere.com/reference/errors: 429 is
+# its rate limit, and 499 is a request cancelled on Cohere's side, which the page says to try
+# again. The page doesn't call 5xx retryable; we retry it as a server-side failure.
+_TRANSIENT_STATUSES = frozenset({429, 499})
 
 
 class CohereReranker:
@@ -58,6 +69,10 @@ class CohereReranker:
                 response.raise_for_status()
             except httpx.TimeoutException as exc:
                 raise OperationTimeoutError("Cohere reranking call timed out") from exc
+            except httpx.HTTPStatusError as exc:
+                raise _status_error(exc.response) from exc
+            except (httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+                raise TransientProviderError("Cohere reranking call failed") from exc
             except httpx.HTTPError as exc:
                 raise ProviderError("Cohere reranking call failed") from exc
             try:
@@ -116,6 +131,16 @@ class CohereReranker:
 
     async def close(self) -> None:
         await self._client.aclose()
+
+
+def _status_error(response: httpx.Response) -> ProviderError:
+    status = response.status_code
+    if status in _TRANSIENT_STATUSES or status >= 500:
+        return TransientProviderError(
+            "Cohere reranking call failed",
+            retry_after_seconds=retry_after_seconds(response.headers),
+        )
+    return ProviderError("Cohere reranking call failed")
 
 
 def _metering(meta: object) -> RerankMetering | None:

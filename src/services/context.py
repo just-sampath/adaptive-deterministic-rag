@@ -10,8 +10,9 @@ from functools import cache
 
 from models.domain import Chunk, Identity, PackedContext, RankedChunk
 from services.contracts import DocumentReader, PassageTokenCounter, Reranker
-from utils.request_context import observed_call
-from utils.settings import ContextConfig
+from utils.request_context import observed_call, stage_timeout
+from utils.retry import NO_RETRY, retry_transient
+from utils.settings import ContextConfig, RetryConfig
 
 _MID_LIST = re.compile(r"^\s*(?:[2-9]|\d{2,})[.)]\s")
 _BACK_REFERENCE = re.compile(
@@ -223,12 +224,14 @@ class ContextBuilder:
         packer: ContextPacker,
         generation_k: int,
         reranking_timeout_seconds: float,
+        retry: RetryConfig = NO_RETRY,
     ) -> None:
         self._reranker = reranker
         self._completer = completer
         self._packer = packer
         self._generation_k = generation_k
         self._reranking_timeout_seconds = reranking_timeout_seconds
+        self._retry = retry
 
     async def build(
         self,
@@ -238,12 +241,17 @@ class ContextBuilder:
         identity: Identity,
         filters: Mapping[str, str | int | float | bool] | None = None,
     ) -> ContextOutcome:
-        async with asyncio.timeout(self._reranking_timeout_seconds):
+        async with stage_timeout(self._reranking_timeout_seconds):
             reranked = (
-                await observed_call(
+                await retry_transient(
                     "rerank",
-                    self._reranker.version,
-                    self._reranker.rerank(query, candidates, len(candidates)),
+                    lambda retry: observed_call(
+                        "rerank",
+                        self._reranker.version,
+                        self._reranker.rerank(query, candidates, len(candidates)),
+                        retry_ordinal=retry,
+                    ),
+                    policy=self._retry,
                 )
                 if candidates
                 else []

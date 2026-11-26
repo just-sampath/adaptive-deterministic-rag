@@ -25,8 +25,9 @@ from services.contracts import FollowupDetector, TextModel
 from services.query_anchors import preserves_explicit_anchors
 from utils.errors import InfrastructureError
 from utils.prompts import CONTEXTUALIZER_SYSTEM, contextualization_user_prompt, history_line
-from utils.request_context import observed_call
-from utils.settings import ContextualizationConfig
+from utils.request_context import observed_call, stage_timeout
+from utils.retry import NO_RETRY, retry_transient
+from utils.settings import ContextualizationConfig, RetryConfig
 from utils.text import ENGLISH_STOPWORDS
 
 logger = logging.getLogger(__name__)
@@ -209,6 +210,7 @@ class QueryUnderstandingService:
         query_drift_threshold: float,
         detection_timeout_seconds: float,
         contextualization_timeout_seconds: float,
+        retry: RetryConfig = NO_RETRY,
     ) -> None:
         self._detector = detector
         self._model = model
@@ -218,6 +220,7 @@ class QueryUnderstandingService:
         self._query_drift_threshold = query_drift_threshold
         self._detection_timeout_seconds = detection_timeout_seconds
         self._contextualization_timeout_seconds = contextualization_timeout_seconds
+        self._retry = retry
 
     async def understand(
         self,
@@ -267,7 +270,7 @@ class QueryUnderstandingService:
         """Return the decision, using the bounded input window if detection fails."""
 
         try:
-            async with asyncio.timeout(self._detection_timeout_seconds):
+            async with stage_timeout(self._detection_timeout_seconds):
                 return await self._detector.detect(question, history), False
         except (TimeoutError, InfrastructureError) as error:
             logger.warning("Follow-up detection failed open: %s", type(error).__name__)
@@ -284,17 +287,23 @@ class QueryUnderstandingService:
         messages: Sequence[ConversationMessage],
     ) -> ModelResult[ContextualizationOutput]:
         history_lines = [history_line(message.role, message.content) for message in messages]
-        async with asyncio.timeout(self._contextualization_timeout_seconds):
-            return await observed_call(
+        user_prompt = contextualization_user_prompt(question, history_lines)
+        async with stage_timeout(self._contextualization_timeout_seconds):
+            return await retry_transient(
                 "contextualization",
-                self._model_name,
-                self._model.complete(
-                    model=self._model_name,
-                    system_prompt=CONTEXTUALIZER_SYSTEM,
-                    user_prompt=contextualization_user_prompt(question, history_lines),
-                    output_type=ContextualizationOutput,
-                    max_output_tokens=self._max_output_tokens,
+                lambda retry: observed_call(
+                    "contextualization",
+                    self._model_name,
+                    self._model.complete(
+                        model=self._model_name,
+                        system_prompt=CONTEXTUALIZER_SYSTEM,
+                        user_prompt=user_prompt,
+                        output_type=ContextualizationOutput,
+                        max_output_tokens=self._max_output_tokens,
+                    ),
+                    retry_ordinal=retry,
                 ),
+                policy=self._retry,
             )
 
 

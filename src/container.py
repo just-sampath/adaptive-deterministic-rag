@@ -143,7 +143,7 @@ def _compose(
     encoder = HybridQueryEncoder(
         dense=embeddings,
         sparse=Bm25SparseEncoder(settings.vector_store.sparse),
-        cache=EmbeddingCache(settings.retrieval.embedding_cache_entries),
+        cache=EmbeddingCache(settings.retrieval.embedding_cache_entries, retry=settings.retries),
         embedding_timeout_seconds=settings.timeouts.embedding_seconds,
     )
     index = build_vector_index_spec(
@@ -215,7 +215,9 @@ def _build_clients(settings: Settings, resources: list[AsyncCloseable]) -> _Clie
         build_openai_client(
             api_key=settings.external.openai_api_key.get_secret_value(),
             base_url=settings.external.openai_base_url,
-            max_retries=settings.ai.max_retries,
+            # The application retries transient failures itself (utils/retry.py), so each try is
+            # traced and bounded by the time its stage has left.
+            max_retries=0,
             timeout_seconds=settings.timeouts.generation_seconds,
         ),
         resources,
@@ -294,6 +296,7 @@ def _build_detector(settings: Settings, text_model: TextModel) -> FollowupDetect
                 model=text_model,
                 model_name=contextualization.detector_model,
                 max_output_tokens=settings.ai.max_output_tokens,
+                retry=settings.retries,
             )
         case FollowupDetectorName.HEURISTIC:
             return HeuristicFollowupDetector()
@@ -325,6 +328,7 @@ def _build_query_handler(
             query_drift_threshold=settings.retrieval.query_drift_threshold,
             detection_timeout_seconds=settings.timeouts.followup_detection_seconds,
             contextualization_timeout_seconds=settings.timeouts.contextualization_seconds,
+            retry=settings.retries,
         ),
         retriever=_build_retriever(
             settings,
@@ -343,18 +347,21 @@ def _build_query_handler(
             packer=ContextPacker(settings.context, count_tokens),
             generation_k=settings.retrieval.generation_k,
             reranking_timeout_seconds=settings.timeouts.reranking_seconds,
+            retry=settings.retries,
         ),
         generator=GenerationService(
             model=text_model,
             model_name=settings.ai.generation_model,
             max_output_tokens=settings.ai.max_output_tokens,
             timeout_seconds=settings.timeouts.generation_seconds,
+            retry=settings.retries,
         ),
         evaluator=OnlineEvaluator(
             model=text_model,
             model_name=settings.ai.evaluation_model,
             max_output_tokens=settings.ai.max_output_tokens,
             timeout_seconds=settings.timeouts.evaluation_seconds,
+            retry=settings.retries,
         ),
         decision=DecisionPolicy(policy=settings.policy, retrieval=settings.retrieval),
         strategies=build_strategy_registry(settings.retrieval),
@@ -392,6 +399,7 @@ def _build_retriever(
         repository=documents,
         config=settings.retrieval,
         retrieval_timeout_seconds=settings.timeouts.retrieval_seconds,
+        retry=settings.retries,
     )
     query_recovery = QueryRecoveryService(
         model=text_model,
@@ -400,6 +408,7 @@ def _build_retriever(
         timeout_seconds=settings.timeouts.query_recovery_seconds,
         max_variants=settings.retrieval.max_query_variants,
         max_decomposed_queries=settings.retrieval.max_decomposed_queries,
+        retry=settings.retries,
     )
     return StrategyRetriever(
         hybrid=hybrid,

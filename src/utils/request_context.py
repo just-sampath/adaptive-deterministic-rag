@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Awaitable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 
@@ -53,6 +53,38 @@ def current_request_id() -> str | None:
 
 def current_identity() -> Identity | None:
     return _identity.get()
+
+
+_deadline: ContextVar[float | None] = ContextVar("deadline", default=None)
+
+
+def current_deadline() -> float | None:
+    """The earliest event-loop deadline bounding the running task, or None outside any stage."""
+
+    return _deadline.get()
+
+
+@contextmanager
+def deadline_scope(when: float) -> Iterator[None]:
+    """Publish a deadline to code in this task; an earlier enclosing deadline still wins."""
+
+    current = _deadline.get()
+    token = _deadline.set(when if current is None else min(current, when))
+    try:
+        yield
+    finally:
+        _deadline.reset(token)
+
+
+@asynccontextmanager
+async def stage_timeout(seconds: float) -> AsyncIterator[None]:
+    """Bound a stage like ``asyncio.timeout`` and tell retries inside it when it ends."""
+
+    async with asyncio.timeout(seconds) as timer:
+        when = timer.when()
+        assert when is not None
+        with deadline_scope(when):
+            yield
 
 
 @dataclass(slots=True)
@@ -131,6 +163,7 @@ def operation(
     reused: bool = False,
     provider: str | None = None,
     adapter: bool = False,
+    retry_ordinal: int = 0,
 ) -> Iterator[None]:
     collector = current_operations()
     parent = _operation_slot.get()
@@ -148,6 +181,7 @@ def operation(
             strategy=collector.strategy,
             strategy_try=collector.strategy_try,
             repair_ordinal=collector.repair_ordinal,
+            retry_ordinal=retry_ordinal,
             status=OperationStatus.REUSED if reused else OperationStatus.COMPLETED,
         )
     )
@@ -190,8 +224,10 @@ def observe_response(
         )
 
 
-async def observed_call[T](stage: str, model: str, call: Awaitable[T]) -> T:
-    with operation(stage, model):
+async def observed_call[T](
+    stage: str, model: str, call: Awaitable[T], *, retry_ordinal: int = 0
+) -> T:
+    with operation(stage, model, retry_ordinal=retry_ordinal):
         result = await call
         slot = _operation_slot.get()
         if (

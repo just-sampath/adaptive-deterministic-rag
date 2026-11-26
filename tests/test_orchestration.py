@@ -66,14 +66,21 @@ from tests.fakes import (
     make_chunk,
 )
 from tests.test_transport import TRUSTED_HEADERS, make_app, make_context
-from utils.errors import OperationTimeoutError, ProviderError, RequestDeadlineExceededError
+from utils.errors import (
+    OperationTimeoutError,
+    ProviderError,
+    RequestDeadlineExceededError,
+    TransientProviderError,
+)
 from utils.prompts import STANDARD_ABSTENTION
+from utils.retry import NO_RETRY
 from utils.settings import (
     ContentMode,
     ContextConfig,
     ContextualizationConfig,
     PolicyConfig,
     RetrievalConfig,
+    RetryConfig,
     Settings,
     SparseConfig,
     TelemetryConfig,
@@ -328,6 +335,7 @@ def build_orchestrator(
     history_ref_limit: int = 8,
     telemetry: TelemetryService | None = None,
     policy: PolicyConfig | None = None,
+    retry: RetryConfig = NO_RETRY,
 ) -> SearchHandler:
     retrieval = RetrievalConfig(
         happy_dense_k=4,
@@ -350,7 +358,7 @@ def build_orchestrator(
     encoder = HybridQueryEncoder(
         dense=FakeEmbeddings(),
         sparse=Bm25SparseEncoder(SparseConfig()),
-        cache=EmbeddingCache(0),
+        cache=EmbeddingCache(0, retry=retry),
         embedding_timeout_seconds=STAGE_SECONDS,
     )
     hybrid = HybridRetriever(
@@ -359,6 +367,7 @@ def build_orchestrator(
         repository=repository,
         config=retrieval,
         retrieval_timeout_seconds=STAGE_SECONDS,
+        retry=retry,
     )
     return SearchHandler(
         query_understanding=QueryUnderstandingService(
@@ -370,6 +379,7 @@ def build_orchestrator(
             query_drift_threshold=retrieval.query_drift_threshold,
             detection_timeout_seconds=STAGE_SECONDS,
             contextualization_timeout_seconds=STAGE_SECONDS,
+            retry=retry,
         ),
         retriever=StrategyRetriever(
             hybrid=hybrid,
@@ -380,6 +390,7 @@ def build_orchestrator(
                 timeout_seconds=STAGE_SECONDS,
                 max_variants=4,
                 max_decomposed_queries=3,
+                retry=retry,
             ),
             config=retrieval,
         ),
@@ -393,18 +404,21 @@ def build_orchestrator(
             packer=ContextPacker(context, utf8_byte_count),
             generation_k=2,
             reranking_timeout_seconds=STAGE_SECONDS,
+            retry=retry,
         ),
         generator=GenerationService(
             model=model,
             model_name="generation-model",
             max_output_tokens=256,
             timeout_seconds=STAGE_SECONDS,
+            retry=retry,
         ),
         evaluator=OnlineEvaluator(
             model=model,
             model_name="evaluation-model",
             max_output_tokens=256,
             timeout_seconds=STAGE_SECONDS,
+            retry=retry,
         ),
         decision=DecisionPolicy(policy=policy, retrieval=retrieval),
         strategies=build_strategy_registry(retrieval),
@@ -1290,6 +1304,48 @@ async def test_provider_timeout_is_not_mislabeled_as_global_deadline(
 
     trace = next(iter(repository.traces.values()))
     assert trace.error_code == "TimeoutError"
+
+
+class _TransientOnce:
+    """Fail the first search with a transient error and count every search started."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self) -> None:
+        self.calls += 1
+        if self.calls == 1:
+            raise TransientProviderError("Qdrant rate limit reached")
+
+
+@pytest.mark.parametrize(
+    ("timeouts", "searches"),
+    [(TimeoutConfig(), 2), (SHORT_BUDGET, 1)],
+    ids=["attempt-has-time", "attempt-deadline-too-close"],
+)
+async def test_the_attempt_deadline_limits_a_retry_inside_a_longer_stage(
+    identity: Identity, timeouts: TimeoutConfig, searches: int
+) -> None:
+    repository = FakeRepository((make_chunk(CHUNK_ID),))
+    model = FakeTextModel()
+    queue_complete_answer(model, "Advantages [E1].")
+    searches_started = _TransientOnce()
+    orchestrator = build_orchestrator(
+        model=model,
+        repository=repository,
+        vector_store=scripted_store(fail_from=1, action=searches_started),
+        timeouts=timeouts,
+        # The retrieval timer alone would leave room for this; a 1 s attempt window doesn't.
+        retry=RetryConfig(max_retries=1, backoff_seconds=0, min_retry_seconds=1.5),
+    )
+
+    if searches == 2:
+        response = await orchestrator.query(identity, QueryRequest(message="Explain the feature"))
+        assert response.status is ResultStatus.COMPLETE
+    else:
+        with pytest.raises(TransientProviderError):
+            await orchestrator.query(identity, QueryRequest(message="Explain the feature"))
+    assert searches_started.calls == searches
 
 
 async def _transport_time_out() -> None:

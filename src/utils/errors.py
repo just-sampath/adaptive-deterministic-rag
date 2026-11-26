@@ -31,6 +31,17 @@ class ProviderResponseError(ProviderError):
     """Raised when a provider returns an unusable response."""
 
 
+class TransientProviderError(ProviderError):
+    """A provider failure that an immediate retry may clear, such as a dropped connection or 429.
+
+    ``retry_after_seconds`` carries the wait the provider asked for, when it sent one.
+    """
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 class NotFoundError(RagError):
     """Raised when an authorized resource does not exist."""
 

@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from openai import AsyncOpenAI
 
 import container
 from container import create_container
@@ -18,6 +19,7 @@ from handlers.traces import TenantTraceHandler
 from middleware.request_telemetry import _TelemetryHost
 from providers.sparse import Bm25SparseEncoder
 from routes.dependencies import RouteContext
+from services.encoding import HybridQueryEncoder
 from services.followup import (
     AlwaysFollowupDetector,
     HeuristicFollowupDetector,
@@ -345,5 +347,38 @@ async def test_built_query_handler_records_encoder_index_and_detector_versions(
         assert versions["query_encoder"] == encoder
         assert versions["vector_index"] == index.physical_collection
         assert versions["followup_detector"] == FollowupDetectorName.MODEL.value
+    finally:
+        await built.close()
+
+
+async def test_the_application_owns_retries_and_every_provider_stage_gets_the_policy(
+    settings: Settings,
+) -> None:
+    built = await create_container(settings)
+    try:
+        (openai_client,) = (
+            item for item in built.external_resources if isinstance(item, AsyncOpenAI)
+        )
+        # SDK retries would hide tries from traces and ignore the stage's remaining time.
+        assert openai_client.max_retries == 0
+        handler = built.query_handler
+        assert isinstance(handler, SearchHandler)
+        detector = handler._query_understanding._detector
+        encoder = handler._retriever._hybrid._encoder
+        assert isinstance(detector, ModelFollowupDetector)
+        assert isinstance(encoder, HybridQueryEncoder)
+        policies = {
+            "contextualization": handler._query_understanding._retry,
+            "followup_detection": detector._retry,
+            "embedding": encoder._cache._retry,
+            "retrieval": handler._retriever._hybrid._retry,
+            "query_recovery": handler._retriever._query_recovery._retry,
+            "rerank": handler._context_builder._retry,
+            "generation": handler._generator._retry,
+            "evaluation": handler._evaluator._retry,
+        }
+        assert {stage: policy is settings.retries for stage, policy in policies.items()} == (
+            dict.fromkeys(policies, True)
+        )
     finally:
         await built.close()

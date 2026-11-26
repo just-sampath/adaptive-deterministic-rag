@@ -577,3 +577,30 @@ def test_new_configuration_sections_parse(make_settings: Callable[..., Settings]
     assert settings.telemetry.direct_write_timeout_seconds == 0.5
     assert settings.vector_store.sparse.k1 == 1.5
     assert settings.timeouts.request_seconds == 30
+
+
+@pytest.mark.parametrize(
+    "retries",
+    [
+        {"max_retries": 2},
+        {"max_retries": -1},
+        {"backoff_seconds": -0.1},
+        {"backoff_seconds": float("inf")},
+        {"min_retry_seconds": -1},
+        {"min_retry_seconds": float("nan")},
+    ],
+    ids=["two-retries", "negative", "negative-wait", "endless-wait", "negative-margin", "nan"],
+)
+def test_retry_settings_stay_bounded(
+    make_settings: Callable[..., Settings], retries: dict[str, float]
+) -> None:
+    with pytest.raises(ValidationError):
+        make_settings(retries=retries)
+
+
+def test_retries_can_be_turned_off_and_the_sdk_retry_setting_is_gone(
+    make_settings: Callable[..., Settings],
+) -> None:
+    assert make_settings(retries={"max_retries": 0}).retries.max_retries == 0
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        make_settings(ai={"provider": "fake", "max_retries": 2})

@@ -60,7 +60,12 @@ from services.telemetry import TelemetryService
 from services.understanding import QueryUnderstandingService
 from utils.errors import InfrastructureError, RequestDeadlineExceededError
 from utils.prompts import PROMPT_VERSIONS, STANDARD_ABSTENTION, VERIFICATION_PROMPT_VERSIONS
-from utils.request_context import collect_operations, current_operations, current_request_id
+from utils.request_context import (
+    collect_operations,
+    current_operations,
+    current_request_id,
+    deadline_scope,
+)
 from utils.settings import ContextualizationConfig, PolicyConfig, RetrievalConfig, TimeoutConfig
 
 _DEADLINE_CODE = "REQUEST_DEADLINE_EXCEEDED"
@@ -235,12 +240,16 @@ class SearchHandler:
     ) -> TerminalResult:
         """Run understanding and strategies inside the attempt budget, salvaging on failure."""
 
-        attempts = asyncio.timeout_at(
+        attempts_end = (
             start + self._timeouts.request_seconds - self._timeouts.finalization_reserve_seconds
         )
+        attempts = asyncio.timeout_at(attempts_end)
         try:
+            # Retries inside any stage also see this deadline, so none starts without
+            # retries.min_retry_seconds of the attempt left.
             async with attempts:
-                return await self._attempt(record, request)
+                with deadline_scope(attempts_end):
+                    return await self._attempt(record, request)
         except (TimeoutError, InfrastructureError) as exc:
             if attempts.expired():
                 record.error_code = _DEADLINE_CODE

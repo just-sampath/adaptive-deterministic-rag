@@ -109,7 +109,6 @@ class AIConfig(ConfigModel):
     embedding_model: str = "text-embedding-3-small"
     embedding_dimension: int = Field(default=1536, ge=1)
     max_output_tokens: int = Field(default=4096, ge=128)
-    max_retries: int = Field(default=2, ge=0, le=10)
     # Reasoning effort per model name; models not listed use the provider default.
     reasoning_effort: dict[str, ReasoningEffort] = Field(default_factory=_default_reasoning_effort)
 
@@ -235,6 +234,14 @@ class TimeoutConfig(ConfigModel):
         return self
 
 
+class RetryConfig(ConfigModel):
+    """One retry of a transient provider failure, made only when the time left can hold it."""
+
+    max_retries: int = Field(default=1, ge=0, le=1)
+    backoff_seconds: float = Field(default=0.25, ge=0, allow_inf_nan=False)
+    min_retry_seconds: float = Field(default=1, ge=0, allow_inf_nan=False)
+
+
 class TelemetryConfig(ConfigModel):
     enabled: bool = True
     write_query_intent_fields: bool = Field(default=False, strict=True)
@@ -319,6 +326,7 @@ class Settings(ConfigModel):
     context: ContextConfig = Field(default_factory=ContextConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     timeouts: TimeoutConfig = Field(default_factory=TimeoutConfig)
+    retries: RetryConfig = Field(default_factory=RetryConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     answers: AnswersConfig = Field(default_factory=AnswersConfig)
     external: ExternalSettings = Field(default_factory=ExternalSettings)

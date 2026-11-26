@@ -62,9 +62,11 @@ Shared objects are either SDK clients intended for concurrent use or synchroniza
 - dense and sparse retrieval are one batched Qdrant `query_batch_points` call;
 - faithfulness and completeness evaluation, and the MongoDB and Qdrant startup branches, run with
   `run_pair` (an `asyncio.TaskGroup`; a failure cancels the sibling and re-raises the original
-  error);
+  error). Each judge retries inside its own child, so a retry doesn't cancel the other judge;
 - recovered query variants run with `run_all` under a semaphore created per call;
-- the query-embedding cache is single-flight: concurrent misses for the same text share one call;
+- the query-embedding cache is single-flight: concurrent misses for the same text share one call,
+  and only the leader retries it. A leader with too little time left for its retry hands the call
+  to a waiter instead of passing on the failure;
 - telemetry uses a bounded queue and one background batch writer;
 - shutdown stops acceptance, drains queued telemetry within a bounded time, then closes providers.
 
@@ -74,6 +76,20 @@ MongoDB operations use the client-side `mongodb.operation_timeout_ms`. The handl
 complete workflow in a global request deadline. Understanding and strategy attempts run under
 `request_seconds - finalization_reserve_seconds`, which leaves time to recheck passages and store the
 conversation turn.
+
+Stage timers run through `stage_timeout` in `utils/request_context.py`, which publishes the stage's
+deadline in a `ContextVar`. The handler publishes the attempt deadline the same way, and the
+earliest one wins. `retry_transient` in `utils/retry.py` reads it: a provider call that fails with
+`TransientProviderError` is retried at most `retries.max_retries` times, after the provider's
+`Retry-After` or `retries.backoff_seconds`, and only if `retries.min_retry_seconds` would still be
+left after the wait. Each try of a model, embedding or rerank call gets its own operation record
+with a `retry_ordinal`. Qdrant search is retried the same way but has no operation record.
+Timeouts, invalid responses and every other failure propagate at once. The runtime OpenAI client
+is built with `max_retries=0`, so a provider retry never happens out of sight of traces and the
+budget. The application doesn't retry MongoDB inside a request. PyMongo keeps its default
+retryable reads, and retryable writes where the server supports them (a replica set or sharded
+cluster, not the standalone in `docker-compose.yml`). The one application retry outside a request
+is the telemetry writer's single replay of a trace batch, described under telemetry below.
 
 When the attempt deadline expires, or a stage raises `TimeoutError` or `InfrastructureError`, the
 best verified answer found so far goes through final evidence checks before it can be returned as
@@ -89,6 +105,21 @@ handler: OpenAI's `APITimeoutError`, an HTTPX `TimeoutException` from Cohere, a 
 `OPERATION_TIMEOUT`. Every other provider or store failure stays an `InfrastructureError` (503).
 Readiness turns a dependency timeout back into `InfrastructureError`, so `/health/ready` reports
 503.
+
+Adapters also mark the failures a retry may clear as `TransientProviderError`, a `ProviderError`
+that still answers 503 when it isn't recovered:
+
+- OpenAI: a connection error other than a timeout, and the statuses its SDK would retry (408, 409,
+  429 and 5xx, unless the response sets `x-should-retry: false`, or any status when it sets
+  `true`);
+- Cohere: a network or remote protocol error, 429, 499 and 5xx;
+- Qdrant: a network or remote protocol error inside `ResponseHandlingException`, an
+  `UnexpectedResponse` with 429 or 5xx, and the client's own rate-limit exceptions,
+  `ResourceExhaustedResponse` and the bare `QdrantException` it raises for a `Retry-After` that
+  isn't a whole number of seconds. These two sit outside its `ApiException` tree and need their
+  own branches.
+
+The adapters pass along the provider's `Retry-After` (or `retry-after-ms`) when it is present.
 
 ## Startup initialization
 
@@ -334,14 +365,15 @@ store no verdicts and keep the generation usage actually spent. A stored attempt
 `outcome` is a legacy record, read with its verdicts as they were stored. With verification
 disabled, writers emit exactly the legacy attempt layout and the previous prompt versions.
 
-Each request collects one record per provider call in a task-local `OperationCollector`. A slot is
-reserved before the call is awaited and tagged with the stage, strategy, strategy try and repair
-ordinal; the adapter fills it as soon as the SDK reply arrives, before parsing, so a reply that
+Each request collects one record per try of a provider call in a task-local `OperationCollector`.
+A slot is reserved before the try is awaited and tagged with the stage, strategy, strategy try,
+repair ordinal and retry ordinal; the adapter fills it as soon as the SDK reply arrives, before parsing, so a reply that
 then fails validation keeps its reported usage. A call that fails or is cancelled without a reply
 has unknown usage, and an embedding cache hit or single-flight follower is recorded as reuse with
 no usage. `RequestTrace.token_usage` sums only reported usage across these records,
 `model_calls` lists every call that received a reply, `usage_coverage` says whether every call
-reported its usage, and attempt records keep their own totals. `handler_outcome` (`returned`, `failed`, `cancelled`, or `unknown` for older traces),
+reported its usage (a failed try that was then retried has unknown usage, so a retried request
+reads as partial), and attempt records keep their own totals. `handler_outcome` (`returned`, `failed`, `cancelled`, or `unknown` for older traces),
 `returned_status` and `returned_document_ids` describe what the handler gave the route, separately
 from `final_status` and `final_source_ids`, which keep the selected verdict and its verified chunk
 IDs. The `http.request.completed` event adds `response_started` and `response_completed`, each set
@@ -406,7 +438,8 @@ A later implementation should:
 2. keep the concrete adapter out of handlers and routes;
 3. add exactly one resolver branch in the composition root and validate its name before any client
    is constructed;
-4. define timeout, error translation, resource ownership, and telemetry behavior;
+4. define timeout, error translation (including which failures are transient), resource ownership,
+   and telemetry behavior;
 5. add boundary and concurrency tests;
 6. preserve tenant/role filters, finite execution budgets, verified sources, and abstention;
 7. give any encoder change a new fingerprint, and reindex before switching the alias;

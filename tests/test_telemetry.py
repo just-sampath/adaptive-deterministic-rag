@@ -263,6 +263,53 @@ async def test_accounting_fields_are_written_only_when_enabled_and_old_rows_stil
     assert stored.final_status is ResultStatus.COMPLETE
 
 
+# The operation row layout readers accepted before retries were recorded.
+_LEGACY_OPERATION_KEYS = {
+    "slot",
+    "operation",
+    "strategy",
+    "strategy_try",
+    "repair_ordinal",
+    "status",
+    "provider",
+    "model",
+    "request_id",
+    "usage",
+    "rerank_metering",
+}
+
+
+async def test_only_a_retried_operation_row_stores_its_retry_ordinal() -> None:
+    collection = create_autospec(AsyncCollection, instance=True)
+    database = cast(AsyncDatabase[dict[str, Any]], {"traces": collection, "events": None})
+    sink = MongoTelemetrySink(
+        database,
+        trace_collection="traces",
+        event_collection="events",
+        write_accounting_fields=True,
+    )
+    succeeded = accounted_trace().operations
+    assert succeeded is not None
+    failed = succeeded[0].model_copy(
+        update={"status": OperationStatus.FAILED, "request_id": None, "usage": None}
+    )
+    retried = succeeded[0].model_copy(update={"slot": 2, "retry_ordinal": 1})
+    trace = accounted_trace().model_copy(update={"operations": (failed, retried)})
+    collection.bulk_write.return_value.upserted_ids = {0: "mongo-id"}
+
+    await sink.write_traces([trace])
+
+    update = collection.bulk_write.await_args.args[0][0]
+    document = BSON(BSON.encode(update._doc["$setOnInsert"])).decode()
+    first_try, retry = document["operations"]
+    assert set(first_try) == _LEGACY_OPERATION_KEYS
+    assert retry["retry_ordinal"] == 1
+    collection.find_one.return_value = document
+    stored = await sink.get_trace("accounted", "tenant")
+    assert stored is not None
+    assert stored.operations == trace.operations
+
+
 @pytest.mark.parametrize("enriched", [False, True], ids=["legacy", "enriched"])
 async def test_pending_trace_reads_like_the_stored_accounting_layout(enriched: bool) -> None:
     service = TelemetryService(

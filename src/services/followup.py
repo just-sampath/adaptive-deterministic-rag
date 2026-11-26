@@ -15,6 +15,8 @@ from models.domain import (
 from services.contracts import TextModel
 from utils.prompts import FOLLOWUP_DETECTOR_SYSTEM, followup_detection_user_prompt, history_line
 from utils.request_context import observed_call
+from utils.retry import NO_RETRY, retry_transient
+from utils.settings import RetryConfig
 
 _FOLLOWUP_REFERENCE = re.compile(
     r"\b(?:it|its|that|this|they|them|those|these|former|latter|above|previous)\b",
@@ -119,10 +121,18 @@ class ModelFollowupDetector:
 
     name = "model"
 
-    def __init__(self, *, model: TextModel, model_name: str, max_output_tokens: int) -> None:
+    def __init__(
+        self,
+        *,
+        model: TextModel,
+        model_name: str,
+        max_output_tokens: int,
+        retry: RetryConfig = NO_RETRY,
+    ) -> None:
         self._model = model
         self._model_name = model_name
         self._max_output_tokens = max_output_tokens
+        self._retry = retry
 
     async def detect(
         self,
@@ -130,16 +140,23 @@ class ModelFollowupDetector:
         history: Sequence[ConversationMessage],
     ) -> FollowupDecision:
         history_lines = [history_line(message.role, message.content) for message in history]
-        result = await observed_call(
+        user_prompt = followup_detection_user_prompt(question, history_lines)
+        # The caller's detection timer bounds both tries.
+        result = await retry_transient(
             "followup_detection",
-            self._model_name,
-            self._model.complete(
-                model=self._model_name,
-                system_prompt=FOLLOWUP_DETECTOR_SYSTEM,
-                user_prompt=followup_detection_user_prompt(question, history_lines),
-                output_type=FollowupClassification,
-                max_output_tokens=self._max_output_tokens,
+            lambda retry: observed_call(
+                "followup_detection",
+                self._model_name,
+                self._model.complete(
+                    model=self._model_name,
+                    system_prompt=FOLLOWUP_DETECTOR_SYSTEM,
+                    user_prompt=user_prompt,
+                    output_type=FollowupClassification,
+                    max_output_tokens=self._max_output_tokens,
+                ),
+                retry_ordinal=retry,
             ),
+            policy=self._retry,
         )
         return FollowupDecision(
             detector=self.name,

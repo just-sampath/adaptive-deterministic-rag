@@ -505,6 +505,8 @@ class ProviderOperation(FrozenModel):
     strategy: RetrievalStrategy | None
     strategy_try: int | None
     repair_ordinal: int
+    # 0 for a call's first try, 1 for its retry. Older traces have no retries and read as 0.
+    retry_ordinal: int = Field(default=0, ge=0)
     status: OperationStatus
     provider: str | None = None
     model: str | None = None

@@ -159,6 +159,10 @@ class MongoTelemetrySink:
         for attempt in document["attempts"]:
             if attempt["outcome"] is None:
                 del attempt["outcome"]
+        for row in document.get("operations") or ():
+            # A first try keeps the row layout older readers accept; only a retry is marked.
+            if row["retry_ordinal"] == 0:
+                del row["retry_ordinal"]
         return document
 
     @mongo_errors

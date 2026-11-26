@@ -92,7 +92,7 @@ from environment variables with no application prefix.
 
 | Source | Examples |
 | --- | --- |
-| `config/default.yaml` | Models, candidate budgets, follow-up detection, policy bounds, timeouts, collection alias, sparse encoder |
+| `config/default.yaml` | Models, candidate budgets, follow-up detection, policy bounds, timeouts, provider retries, collection alias, sparse encoder |
 | `config/local.yaml` | Local-only overrides: `DEBUG` logging, trace accounting fields, and smaller telemetry queue and batch sizes |
 | Environment / `.env` | API keys, MongoDB URI, Qdrant URL/key, trusted-header secrets |
 | Environment / `.env` | `APP_ENV`, `CONFIG_DIR`, and `TELEMETRY_HASH_KEY` |
@@ -142,10 +142,32 @@ that accepts attempts with an outcome and citation assessments.
 
 Request totals always come from every provider call the request made, including calls of an attempt
 that a failed judge or a cancellation cut short. `telemetry.write_accounting_fields` adds the
-per-call records and the handler outcome to stored traces. While it is `false`, new MongoDB rows
-keep the previous top-level keys and pending traces read the same way. `config/local.yaml` sets it
-to `true`. For other deployments, upgrade every trace reader first, and after enabling it roll back
-only to a reader that accepts these fields.
+per-call records and the handler outcome to stored traces. A retried call has one record per try;
+only the retry's record stores `retry_ordinal`, so a call that wasn't retried keeps the earlier
+record layout. The failed first try has unknown usage, so a request with a retry reports partial
+`usage_coverage`. While it is `false`, new MongoDB rows keep the previous top-level keys and
+pending traces read the same way. `config/local.yaml` sets it to `true`. For other deployments,
+upgrade every trace reader first, and after enabling it roll back only to a reader that accepts
+these fields. A deployment that already writes them should upgrade its readers before its writers,
+because an older reader can't read a trace with a retry.
+
+| Provider retry setting | Default | Meaning |
+| --- | --- | --- |
+| `retries.max_retries` | `1` | Retries per provider call after a transient failure. `0` turns retries off; one is the most allowed. |
+| `retries.backoff_seconds` | `0.25` | Wait before the retry when the provider didn't send `Retry-After`. |
+| `retries.min_retry_seconds` | `1` | Skip the retry unless at least this much of the stage's time would be left after the wait. |
+
+The application retries OpenAI, Cohere and Qdrant calls itself; the OpenAI client's own retries are
+off. Only failures an immediate retry can clear count as transient: a connection failure other than
+a timeout, 429 and 5xx. For OpenAI that follows its SDK's rule, which adds 408 and 409, honours an
+`x-should-retry` response header and counts any transport error as a connection failure. For
+Cohere it also includes 499. Timeouts, invalid responses and other errors are not retried. A retry
+waits for the provider's `Retry-After` when it sends one, and starts only if at least
+`retries.min_retry_seconds` of the stage's timer and of the attempt deadline would be left after
+the wait, so a retry that starts late can still time out. MongoDB keeps its driver's own retries.
+The local seed script runs outside any request budget and gives its OpenAI client
+`retries.max_retries` SDK retries instead: at most one, none when it is `0`, and unlike the
+application's retries these also retry timeouts.
 
 `APP_ENV` defaults to `production` when unset, so a missing value fails closed. Production startup
 rejects the placeholder `AUTH_SHARED_TOKEN`, `DEBUG_TOKEN`, and `TELEMETRY_HASH_KEY` values, and it
@@ -173,6 +195,7 @@ CONFIG_DIR=config
 # Query rewrite diagnostics are configured in YAML with telemetry.write_query_intent_fields.
 # Answer verification is configured in YAML with policy.verify_answers.
 # Trace accounting fields are configured in YAML with telemetry.write_accounting_fields.
+# Provider retries are configured in YAML with retries.max_retries, retries.backoff_seconds and retries.min_retry_seconds.
 OPENAI_API_KEY=
 OPENAI_BASE_URL=
 COHERE_API_KEY=
@@ -398,7 +421,8 @@ A failed request returns a JSON `error` code. `REQUEST_DEADLINE_EXCEEDED` (504) 
 or attempt deadline expired with no verified answer to return. `OPERATION_TIMEOUT` (504) means a
 stage timer expired, or an upstream client's own timeout did: an OpenAI or Cohere call, a Qdrant
 request, or a MongoDB operation, including server selection. Any other provider or store failure
-is `SERVICE_UNAVAILABLE` (503). `GET /health/ready` reports a failed or timed-out dependency as
+is `SERVICE_UNAVAILABLE` (503), including a transient failure whose retry also failed or didn't
+fit and a Qdrant rate limit. `GET /health/ready` reports a failed or timed-out dependency as
 503.
 Partial answers end with a verification disclosure that lists the unanswered requirements.
 `metadata.degraded` is true when a stage timeout or infrastructure failure was salvaged into a

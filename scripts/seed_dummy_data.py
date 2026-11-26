@@ -195,7 +195,8 @@ async def seed_dummy_data(
     ai_client = build_openai_client(
         api_key=settings.external.openai_api_key.get_secret_value(),
         base_url=settings.external.openai_base_url,
-        max_retries=settings.ai.max_retries,
+        # The seed runs outside any request budget, so the SDK's own retry is enough here.
+        max_retries=settings.retries.max_retries,
         timeout_seconds=settings.timeouts.generation_seconds,
     )
     try:

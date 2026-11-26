@@ -30,6 +30,7 @@ from utils.errors import (
     OperationTimeoutError,
     ProviderError,
     ProviderResponseError,
+    TransientProviderError,
 )
 from utils.request_context import collect_operations, observed_call
 
@@ -257,3 +258,124 @@ async def test_cohere_records_its_request_id_and_billed_units_but_no_tokens() ->
     assert row.rerank_metering.billed_units == {"search_units": 1.0}
     # Search units are a billing unit, never tokens.
     assert row.usage is None
+
+
+def _openai_status(status: int, headers: dict[str, str] | None = None) -> _Handler2:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            status, json={"error": {"message": "failed"}}, headers=headers, request=request
+        )
+
+    return handler
+
+
+@pytest.mark.parametrize("call", [_complete, _embed], ids=["structured", "embedding"])
+@pytest.mark.parametrize(
+    ("handler", "transient", "retry_after"),
+    [
+        (_openai_refused, True, None),
+        (_openai_status(429, {"retry-after": "2"}), True, 2.0),
+        (_openai_status(500), True, None),
+        (_openai_status(408), True, None),
+        (_openai_status(409), True, None),
+        (_openai_status(500, {"x-should-retry": "false"}), False, None),
+        (_openai_status(400, {"x-should-retry": "true"}), True, None),
+        (_openai_status(400), False, None),
+        (_openai_unauthorized, False, None),
+    ],
+    ids=[
+        "connection",
+        "rate-limit",
+        "server",
+        "request-timeout",
+        "conflict",
+        "server-says-no-retry",
+        "server-says-retry",
+        "bad-request",
+        "auth",
+    ],
+)
+async def test_openai_failures_the_sdk_would_retry_are_transient(
+    call: Callable[[AsyncOpenAI], object],
+    handler: _Handler2,
+    transient: bool,
+    retry_after: float | None,
+) -> None:
+    with pytest.raises(ProviderError) as caught:
+        await call(_openai(handler))  # type: ignore[misc]
+
+    assert isinstance(caught.value, TransientProviderError) is transient
+    if isinstance(caught.value, TransientProviderError):
+        assert caught.value.retry_after_seconds == retry_after
+
+
+def _status(status: int, headers: dict[str, str] | None = None) -> _Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={}, headers=headers, request=request)
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    ("handler", "transient", "retry_after"),
+    [
+        (_cohere_refused, True, None),
+        (_status(429, {"retry-after": "1"}), True, 1.0),
+        (_status(499), True, None),
+        (_status(500), True, None),
+        (_cohere_unavailable, True, None),
+        (_status(400), False, None),
+        (_status(401), False, None),
+        (_status(402), False, None),
+        (_status(404), False, None),
+    ],
+    ids=[
+        "connection",
+        "rate-limit",
+        "cancelled",
+        "server",
+        "unavailable",
+        "bad-request",
+        "auth",
+        "billing",
+        "not-found",
+    ],
+)
+async def test_cohere_temporary_failures_are_transient(
+    handler: _Handler, transient: bool, retry_after: float | None
+) -> None:
+    with pytest.raises(ProviderError) as caught:
+        await _rerank(handler)
+
+    assert isinstance(caught.value, TransientProviderError) is transient
+    if isinstance(caught.value, TransientProviderError):
+        assert caught.value.retry_after_seconds == retry_after
+
+
+@pytest.mark.parametrize(
+    ("handler", "retry_after"),
+    [
+        (_status(429, {"Retry-After": "3"}), 3.0),
+        (_status(429, {"Retry-After": "soon"}), None),
+        (_status(429), None),
+        (_cohere_unavailable, None),
+        (_cohere_refused, None),
+    ],
+    ids=["rate-limit", "unreadable-retry-after", "rate-limit-no-header", "unavailable", "refused"],
+)
+async def test_qdrant_rate_limits_and_outages_are_transient_service_errors(
+    handler: _Handler, retry_after: float | None
+) -> None:
+    # The client raises its rate-limit error outside its ApiException tree; it must still map.
+    with pytest.raises(TransientProviderError) as caught:
+        await _qdrant_health(handler)
+
+    assert isinstance(caught.value, InfrastructureError)
+    assert caught.value.retry_after_seconds == retry_after
+
+
+async def test_qdrant_client_errors_are_not_transient() -> None:
+    with pytest.raises(ProviderError) as caught:
+        await _qdrant_health(_status(400))
+
+    assert not isinstance(caught.value, TransientProviderError)

@@ -5,24 +5,29 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections import OrderedDict
+from collections.abc import Awaitable
 from dataclasses import replace
 
 from models.domain import EmbeddingResult, EncodedQuery, ModelCallTrace, ModelUsage
 from services.contracts import EmbeddingProvider, SparseEncoder
-from utils.request_context import observed_call, operation
+from utils.errors import TransientProviderError
+from utils.request_context import observed_call, operation, stage_timeout
+from utils.retry import NO_RETRY, retry_transient
+from utils.settings import RetryConfig
 
 
 class EmbeddingCache:
     """Bounded LRU embedding cache where concurrent identical misses share one provider call."""
 
-    def __init__(self, max_entries: int) -> None:
+    def __init__(self, max_entries: int, *, retry: RetryConfig = NO_RETRY) -> None:
         self._max_entries = max_entries
+        self._retry = retry
         self._values: OrderedDict[str, EmbeddingResult] = OrderedDict()
         self._inflight: dict[str, asyncio.Future[EmbeddingResult]] = {}
 
     async def get_or_create(self, text: str, provider: EmbeddingProvider) -> EmbeddingResult:
         if self._max_entries == 0:
-            return await observed_call("embedding", provider.model, provider.embed_query(text))
+            return await self._load(text, provider)
         key = _cache_key(provider.fingerprint, text)
         while True:
             cached = self._values.get(key)
@@ -33,8 +38,9 @@ class EmbeddingCache:
             pending = self._inflight.get(key)
             if pending is None:
                 return await self._fill(key, text, provider)
-            # Waiting does not cancel the shared future. A cancelled leader leaves no result, so
-            # the waiter loops back and becomes the leader under its own budget.
+            # Waiting does not cancel the shared future. A cancelled leader, or one that ran out of
+            # time for its retry, leaves no result, so the waiter loops back and becomes the
+            # leader under its own budget.
             await asyncio.wait({pending})
             if not pending.cancelled():
                 # A failed leader's error is re-raised here. Only a value actually shared is
@@ -46,11 +52,27 @@ class EmbeddingCache:
     async def _fill(self, key: str, text: str, provider: EmbeddingProvider) -> EmbeddingResult:
         future: asyncio.Future[EmbeddingResult] = asyncio.get_running_loop().create_future()
         self._inflight[key] = future
+        tries = 0
+
+        def attempt(retry: int) -> Awaitable[EmbeddingResult]:
+            nonlocal tries
+            tries = retry + 1
+            return self._embed(text, provider, retry)
+
         try:
-            result = await observed_call("embedding", provider.model, provider.embed_query(text))
+            # Only the leader retries; waiters share its final result or error.
+            result = await retry_transient("embedding", attempt, policy=self._retry)
         except asyncio.CancelledError:
             # The leader's own cancellation (timeout or disconnect) is not a provider failure.
             future.cancel()
+            raise
+        except TransientProviderError as exc:
+            if tries > self._retry.max_retries:
+                _fail(future, exc)
+            else:
+                # The leader ran out of time before the retry it was owed. A waiter with more
+                # time left takes over the call instead of inheriting a failure it could retry.
+                future.cancel()
             raise
         except Exception as exc:
             _fail(future, exc)
@@ -61,6 +83,17 @@ class EmbeddingCache:
             return result
         finally:
             del self._inflight[key]
+
+    async def _load(self, text: str, provider: EmbeddingProvider) -> EmbeddingResult:
+        return await retry_transient(
+            "embedding", lambda retry: self._embed(text, provider, retry), policy=self._retry
+        )
+
+    @staticmethod
+    def _embed(text: str, provider: EmbeddingProvider, retry: int) -> Awaitable[EmbeddingResult]:
+        return observed_call(
+            "embedding", provider.model, provider.embed_query(text), retry_ordinal=retry
+        )
 
     def _store(self, key: str, result: EmbeddingResult) -> None:
         self._values[key] = result
@@ -98,7 +131,7 @@ class HybridQueryEncoder:
         return self._sparse.requires_idf_modifier
 
     async def encode(self, text: str) -> EncodedQuery:
-        async with asyncio.timeout(self._embedding_timeout_seconds):
+        async with stage_timeout(self._embedding_timeout_seconds):
             embedding = await self._cache.get_or_create(text, self._dense)
         return EncodedQuery(
             text=text,

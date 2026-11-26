@@ -5,7 +5,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, TypeVar, cast
 
-from openai import APITimeoutError, AsyncOpenAI, Omit, OpenAIError, omit
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+    Omit,
+    OpenAIError,
+    omit,
+)
 from openai.lib._pydantic import to_strict_json_schema
 from openai.types.responses import ResponseFormatTextJSONSchemaConfigParam
 from openai.types.shared import ReasoningEffort
@@ -13,11 +21,19 @@ from openai.types.shared_params import Reasoning
 from pydantic import BaseModel, ValidationError
 
 from models.domain import EmbeddingResult, ModelResult, ModelUsage
-from utils.errors import OperationTimeoutError, ProviderError, ProviderResponseError
+from utils.errors import (
+    OperationTimeoutError,
+    ProviderError,
+    ProviderResponseError,
+    TransientProviderError,
+)
 from utils.request_context import observe_response, operation
+from utils.retry import retry_after_seconds
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 _EMBEDDING_BATCH_SIZE = 256
+# Besides any 5xx, the statuses the SDK's own retry rule accepts (openai 3.3.1 ``_should_retry``).
+_TRANSIENT_STATUSES = frozenset({408, 409, 429})
 # Schema keys whose values map names to subschemas; the names themselves are not keywords.
 _NAMED_SUBSCHEMAS = frozenset({"properties", "$defs", "definitions", "patternProperties"})
 
@@ -76,7 +92,7 @@ class OpenAITextModel:
             except APITimeoutError as exc:
                 raise OperationTimeoutError("OpenAI structured model call timed out") from exc
             except OpenAIError as exc:
-                raise ProviderError("OpenAI structured model call failed") from exc
+                raise _provider_error("OpenAI structured model call failed", exc) from exc
             usage = _response_usage(response.usage)
             request_id = getattr(response, "_request_id", None)
             observe_response(
@@ -193,7 +209,7 @@ class OpenAIEmbeddingProvider:
             except APITimeoutError as exc:
                 raise OperationTimeoutError("OpenAI embedding call timed out") from exc
             except OpenAIError as exc:
-                raise ProviderError("OpenAI embedding call failed") from exc
+                raise _provider_error("OpenAI embedding call failed", exc) from exc
             request_id = getattr(response, "_request_id", None)
             batch_usage = (
                 ModelUsage(
@@ -227,6 +243,26 @@ class OpenAIEmbeddingProvider:
                 )
                 for position, item in enumerate(ordered)
             ]
+
+
+def _provider_error(message: str, error: OpenAIError) -> ProviderError:
+    """Mark what the SDK would retry on its own as transient; the application retries it instead.
+
+    Timeouts are translated before this is reached. The SDK reports any other transport failure as
+    a connection error, a TLS or protocol failure included, so those get one retry too.
+    """
+
+    if isinstance(error, APIConnectionError):
+        return TransientProviderError(message)
+    if isinstance(error, APIStatusError):
+        headers = error.response.headers
+        advice = headers.get("x-should-retry")
+        status = error.status_code
+        if advice == "true" or (
+            advice != "false" and (status in _TRANSIENT_STATUSES or status >= 500)
+        ):
+            return TransientProviderError(message, retry_after_seconds=retry_after_seconds(headers))
+    return ProviderError(message)
 
 
 def _response_usage(usage: object | None) -> ModelUsage:
